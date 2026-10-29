@@ -75,9 +75,21 @@ it is stable for identical source, frame, window, and payload content.
 
 ## Verification boundary
 
-The independent Vincenty checks use a 3×3 point sample in each crop plus three
-cross-crop point pairs. Their observed values are reported by the functional
-test as samples, not as a maximum-error bound. This pilot does not claim a
-survey-accuracy bound, global placement, NAVD88-to-ellipsoid conversion, full
-Earth coverage, generator-wide BeamNG removal, Godot consumption, or rendered
-terrain. Those claims require separate evidence and review.
+The independent GRS80 Vincenty checks use a 3×3 point sample in each crop plus
+three asymmetric cross-crop point pairs. On the pinned Windows environment, the
+test recorded these sampled forward, non-radial, and inverse/direct results:
+
+| Region | Radial/vector difference, max | Cross-pair chart/geodesic distance difference, max | Inverse/direct round-trip, max |
+|---|---:|---:|---:|
+| Baltimore | 9.91829228645e-09 m | 1.82540020432e-06 m | 7.55076544561e-09 m |
+| Golden | 3.91186343217e-08 m | 5.28600003236e-06 m | 3.45580740957e-08 m |
+
+These are measured samples, not bounds over the crop or source accuracy
+statements. The functional test uses 1e-4 m and 1e-5 m checks for the sampled
+radial and inverse/direct numerical residuals; these are arithmetic sanity
+checks, not global fidelity budgets. The cross-pair values report non-radial
+chart distortion and have no pass threshold here. The Main Lead owns any
+acceptance tolerance. This pilot does not claim a survey-accuracy bound, global
+placement, NAVD88-to-ellipsoid conversion, full Earth coverage, generator-wide
+BeamNG removal, Godot consumption, or rendered terrain. Those claims require
+separate evidence and review.

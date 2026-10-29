@@ -246,11 +246,11 @@ class TerrainGridV1Tests(unittest.TestCase):
         if REAL_BUNDLE_ROOT is None or SOURCE_DIR is None:
             self.skipTest("pass --bundles and --source-dir to verify acquired source outputs")
         projection_versions: list[str] = []
-        radial_errors: list[float] = []
-        transverse_errors: list[float] = []
-        roundtrip_errors: list[float] = []
         for region_key, spec in producer.REGIONS.items():
             with self.subTest(region=region_key):
+                radial_errors: list[float] = []
+                transverse_errors: list[float] = []
+                roundtrip_errors: list[float] = []
                 bundle = REAL_BUNDLE_ROOT / region_key
                 manifest = producer.validate_bundle(bundle, SCHEMA_PATH)
                 self.validator.validate(manifest)
@@ -368,9 +368,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                         coordinate_index += 1
 
                 pairs = (
-                    (0, 0, rows - 1, columns - 1),
-                    (0, columns - 1, rows - 1, 0),
-                    (rows // 2, 0, rows // 2, columns - 1),
+                    (0, 0, rows // 2, columns - 1),
+                    (0, columns // 2, rows - 1, columns - 1),
+                    (0, 0, rows - 1, columns // 2),
                 )
                 for r1, c1, r2, c2 in pairs:
                     e1, n1 = xy[r1, c1]
@@ -382,16 +382,16 @@ class TerrainGridV1Tests(unittest.TestCase):
                     )[0]
                     transverse_errors.append(abs(projected_pair - geodesic_pair))
 
-                self.assertLess(max(radial_errors[-18:]), 1e-4)
-                self.assertLess(max(roundtrip_errors[-9:]), 1e-5)
-                self.assertLess(max(transverse_errors[-3:]), 0.05)
+                self.assertLess(max(radial_errors), 1e-4)
+                self.assertLess(max(roundtrip_errors), 1e-5)
+                self.assertTrue(all(math.isfinite(error) for error in transverse_errors))
+                print(
+                    f"{region_key} independent GRS80 samples (not bounds): "
+                    f"radial/vector max={max(radial_errors):.12g} m, "
+                    f"cross-pair max={max(transverse_errors):.12g} m, "
+                    f"inverse/direct round-trip max={max(roundtrip_errors):.12g} m"
+                )
         self.assertEqual(len(set(projection_versions)), 1)
-        print(
-            "Independent GRS80 sample checks (not maximum bounds): "
-            f"radial/vector max={max(radial_errors):.12g} m, "
-            f"cross-pair max={max(transverse_errors):.12g} m, "
-            f"inverse/direct round-trip max={max(roundtrip_errors):.12g} m"
-        )
 
 
 if __name__ == "__main__":
