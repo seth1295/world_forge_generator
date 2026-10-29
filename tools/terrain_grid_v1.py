@@ -40,6 +40,9 @@ PRODUCER_NAME = "WorldForge Terrain Grid Producer"
 PRODUCER_VERSION = "1.0.0"
 SOURCE_VERIFIED_DATE = "2026-10-29"
 MANIFEST_LIMIT_BYTES = 64 * 1024
+# Match source.raster.byte_length and metadata/product_record.byte_length in Terrain Grid v1.
+MAX_SOURCE_RASTER_BYTES = 4_294_967_295
+MAX_SOURCE_METADATA_BYTES = 10 * 1024 * 1024
 MAX_SAMPLES = 4_194_304
 MAX_SOURCE_HEIGHT_M = 12_000.0
 MAX_RELATIVE_HEIGHT_M = 24_000.0
@@ -129,39 +132,40 @@ class VerifiedSource:
     raster_max: float
 
 
-def _sha256_stream(file_obj: BinaryIO) -> str:
+def _sha256_stream(file_obj: BinaryIO, *, max_bytes: int | None = None) -> tuple[str, int]:
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be nonnegative")
     digest = hashlib.sha256()
-    for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+    total = 0
+    while True:
+        read_size = (
+            1024 * 1024
+            if max_bytes is None
+            else min(1024 * 1024, max_bytes - total + 1)
+        )
+        chunk = file_obj.read(read_size)
+        if not chunk:
+            break
+        if max_bytes is not None and total + len(chunk) > max_bytes:
+            raise ProducerError(f"file exceeds {max_bytes} byte limit while hashing")
         digest.update(chunk)
-    return digest.hexdigest()
+        total += len(chunk)
+    return digest.hexdigest(), total
 
 
-def sha256_file(path: Path) -> tuple[str, int]:
-    """Return a streaming SHA-256 and byte count for one file."""
+def sha256_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
+    """Return a bounded streaming SHA-256 and byte count for one file."""
     try:
+        size = path.stat().st_size
+        if max_bytes is not None and size > max_bytes:
+            raise ProducerError(f"file exceeds {max_bytes} byte limit: {path.name}")
         with path.open("rb") as source_file:
-            size = path.stat().st_size
-            return _sha256_stream(source_file), size
+            digest, actual_size = _sha256_stream(source_file, max_bytes=max_bytes)
+            return digest, actual_size
+    except ProducerError:
+        raise
     except OSError as exc:
         raise ProducerError(f"cannot read source file {path.name}: {exc}") from exc
-
-
-def _creation_time_utc_seconds(path: Path) -> str:
-    """Read Windows file creation time, rounded to the ledger's second precision."""
-    try:
-        stat_result = path.stat()
-    except OSError as exc:
-        raise ProducerError(f"cannot read source creation time for {path.name}: {exc}") from exc
-    created = getattr(stat_result, "st_birthtime", None)
-    if created is None:
-        if os.name != "nt":
-            raise ProducerError(
-                "acquisition_time_basis requires Windows CreationTimeUtc; "
-                "no filesystem birth time is available on this platform"
-            )
-        created = stat_result.st_ctime
-    instant = datetime.fromtimestamp(created, tz=timezone.utc).replace(microsecond=0)
-    return instant.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -191,7 +195,7 @@ def load_json_unique(path: Path, *, max_bytes: int | None = None) -> dict[str, A
 
 def _ledger_row(
     ledger_path: Path, spec: RegionSpec
-) -> tuple[str, list[tuple[int, str]], list[str]]:
+) -> tuple[list[tuple[int, str]], list[str], str]:
     try:
         text = ledger_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -204,16 +208,45 @@ def _ledger_row(
         )
         raise ProducerError(message)
     line = matches[0]
-    records = [
-        (int(size.replace(",", "")), digest.lower())
-        for size, digest in re.findall(r"([0-9][0-9,]*) bytes; SHA-256 `([0-9A-Fa-f]{64})`", line)
-    ]
-    if len(records) != 3:
+    record_matches = re.findall(
+        r"([0-9][0-9,]*) bytes; SHA-256 `([0-9A-Fa-f]{64})`", line
+    )
+    if len(record_matches) != 3:
         raise ProducerError(
             f"ledger row must record raster, XML, and TNM JSON hashes for {spec.key}"
         )
+    limits = (
+        MAX_SOURCE_RASTER_BYTES,
+        MAX_SOURCE_METADATA_BYTES,
+        MAX_SOURCE_METADATA_BYTES,
+    )
+    records: list[tuple[int, str]] = []
+    for (size_text, digest), limit in zip(record_matches, limits, strict=True):
+        digits = size_text.replace(",", "")
+        if len(digits) > 10:
+            raise ProducerError(f"source ledger size exceeds the v1 limit for {spec.key}")
+        try:
+            size = int(digits)
+        except ValueError as exc:
+            raise ProducerError(f"source ledger has an invalid size for {spec.key}") from exc
+        if size < 1 or size > limit:
+            raise ProducerError(f"source ledger size is outside the v1 byte limit for {spec.key}")
+        records.append((size, digest.lower()))
     urls = re.findall(r"\]\((https?://[^)]+)\)", line)
-    return line, records, urls
+    receipts = re.findall(r"local snapshot file-creation receipt `([^`]+)`", line)
+    if len(receipts) != 1 or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", receipts[0]
+    ):
+        raise ProducerError(
+            f"source ledger must contain one UTC acquisition receipt for {spec.key}"
+        )
+    try:
+        datetime.fromisoformat(receipts[0][:-1] + "+00:00")
+    except ValueError as exc:
+        raise ProducerError(
+            f"source ledger acquisition receipt is not a valid UTC time for {spec.key}"
+        ) from exc
+    return records, urls, receipts[0]
 
 
 def _read_xml_text(path: Path) -> list[str]:
@@ -226,7 +259,7 @@ def _read_xml_text(path: Path) -> list[str]:
 
 def _verify_record_and_ledger(
     source_dir: Path, ledger_path: Path, spec: RegionSpec
-) -> tuple[dict[str, Any], tuple[tuple[int, str], ...]]:
+) -> tuple[dict[str, Any], tuple[tuple[int, str], ...], str]:
     _reject_reparse(source_dir)
     raster_path = source_dir / spec.raster_name
     xml_path = source_dir / spec.xml_name
@@ -237,8 +270,38 @@ def _verify_record_and_ledger(
     for path in (raster_path, xml_path, record_path):
         _reject_reparse(path)
 
-    row, expected, ledger_urls = _ledger_row(ledger_path, spec)
-    actual_hashes = [sha256_file(path) for path in (raster_path, xml_path, record_path)]
+    expected, ledger_urls, acquired_at_utc = _ledger_row(ledger_path, spec)
+    source_paths = (raster_path, xml_path, record_path)
+    limits = (
+        MAX_SOURCE_RASTER_BYTES,
+        MAX_SOURCE_METADATA_BYTES,
+        MAX_SOURCE_METADATA_BYTES,
+    )
+    for label, path, (expected_size, _expected_digest), max_bytes in zip(
+        ("raster", "XML metadata", "TNM product record"),
+        source_paths,
+        expected,
+        limits,
+        strict=True,
+    ):
+        if expected_size < 1 or expected_size > max_bytes:
+            raise ProducerError(f"{label} exceeds the v1 byte limit for {spec.key}")
+        try:
+            actual_size = path.stat().st_size
+        except OSError as exc:
+            raise ProducerError(f"cannot inspect source file {path.name}: {exc}") from exc
+        if actual_size > max_bytes:
+            raise ProducerError(f"{label} exceeds the v1 byte limit for {spec.key}")
+        if actual_size != expected_size:
+            raise ProducerError(
+                f"{label} size mismatch before hashing for {spec.key}: "
+                f"expected {expected_size} bytes, got {actual_size}"
+            )
+
+    actual_hashes = [
+        sha256_file(path, max_bytes=expected_size)
+        for path, (expected_size, _expected_digest) in zip(source_paths, expected, strict=True)
+    ]
     for label, expected_pair, actual_pair in zip(
         ("raster", "XML metadata", "TNM product record"), expected, actual_hashes, strict=True
     ):
@@ -276,18 +339,16 @@ def _verify_record_and_ledger(
         raise ProducerError(f"XML metadata does not verify NAD83 for {spec.key}")
     if "North American Vertical Datum of 1988" not in xml_text:
         raise ProducerError(f"XML metadata does not verify NAVD88 for {spec.key}")
-    return record, tuple(expected)
+    return record, tuple(expected), acquired_at_utc
 
 
 def _verify_raster_window(
     source_dir: Path, ledger_path: Path, spec: RegionSpec
 ) -> tuple[VerifiedSource, np.ndarray, float]:
-    record, expected = _verify_record_and_ledger(source_dir, ledger_path, spec)
+    record, expected, acquired_at_utc = _verify_record_and_ledger(source_dir, ledger_path, spec)
     raster_path = source_dir / spec.raster_name
     xml_path = source_dir / spec.xml_name
     record_path = source_dir / spec.record_name
-    acquired_at_utc = _creation_time_utc_seconds(raster_path)
-
     try:
         with rasterio.open(raster_path, "r") as dataset:
             if dataset.driver != "GTiff":
@@ -600,7 +661,7 @@ def _manifest_source(
         "product_date": spec.product_date,
         "source_uri": record["downloadURL"],
         "acquired_at_utc": source.acquired_at_utc,
-        "acquisition_time_basis": "filesystem_creation_time",
+        "acquisition_time_basis": "recorded_download_receipt",
         "snapshot_verified_date": SOURCE_VERIFIED_DATE,
         "raster": {
             "byte_length": source.raster_bytes,
@@ -787,18 +848,42 @@ def _build_manifest(
     return manifest
 
 
-def _producer_commit() -> str:
-    repo_root = Path(__file__).resolve().parents[1]
+def _producer_commit(repo_root: Path | None = None) -> str:
+    """Return HEAD only when the producer tree has no tracked or untracked changes."""
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parents[1]
     try:
+        state = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+        if state.stdout.strip():
+            raise ProducerError(
+                "producer worktree is dirty; commit or remove tracked and untracked "
+                "changes before generation"
+            )
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
             shell=False,
         )
+    except ProducerError:
+        raise
     except (OSError, subprocess.SubprocessError) as exc:
         raise ProducerError(f"cannot determine producer commit: {exc}") from exc
     commit = completed.stdout.strip().lower()
@@ -813,9 +898,10 @@ def _reject_reparse(path: Path) -> None:
         raise ProducerError(f"refusing a symlink or reparse point: {path.name}")
 
 
-def _write_exclusive(path: Path, data: bytes) -> None:
+def _write_exclusive(path: Path, data: bytes, created_paths: list[Path]) -> None:
     try:
         with path.open("xb") as output:
+            created_paths.append(path)
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
@@ -889,7 +975,7 @@ def validate_bundle(bundle_dir: Path, schema_path: Path) -> dict[str, Any]:
         try:
             if path.stat().st_size != expected_length:
                 raise ProducerError(f"payload byte length mismatch for {filename}")
-            actual_hash, actual_size = sha256_file(path)
+            actual_hash, actual_size = sha256_file(path, max_bytes=expected_length)
             if actual_size != expected_length or actual_hash != payload["sha256"]:
                 raise ProducerError(f"payload hash mismatch for {filename}")
             payload_bytes[key] = path.read_bytes()
@@ -972,25 +1058,31 @@ def build_bundle(
     if bundle_dir.exists() or bundle_dir.is_symlink():
         raise ProducerError(f"refusing to overwrite existing bundle directory: {bundle_dir.name}")
     created_files: list[Path] = []
+    created_bundle_dir = False
     try:
         bundle_dir.mkdir()
-        _write_exclusive(bundle_dir / "horizontal_xy.f64le", horizontal_payload)
-        created_files.append(bundle_dir / "horizontal_xy.f64le")
-        _write_exclusive(bundle_dir / "height_samples.f32le", height_payload)
-        created_files.append(bundle_dir / "height_samples.f32le")
-        _write_exclusive(bundle_dir / "manifest.json", serialized_manifest)
-        created_files.append(bundle_dir / "manifest.json")
+        created_bundle_dir = True
+        _write_exclusive(bundle_dir / "horizontal_xy.f64le", horizontal_payload, created_files)
+        _write_exclusive(bundle_dir / "height_samples.f32le", height_payload, created_files)
+        _write_exclusive(bundle_dir / "manifest.json", serialized_manifest, created_files)
         validated = validate_bundle(bundle_dir, schema_path)
-    except Exception:
+    except BaseException as exc:
+        cleanup_failures: list[str] = []
         for created in created_files:
             try:
                 created.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                cleanup_failures.append(created.name)
+        if created_bundle_dir:
+            try:
+                bundle_dir.rmdir()
             except OSError:
-                pass
-        try:
-            bundle_dir.rmdir()
-        except OSError:
-            pass
+                cleanup_failures.append(bundle_dir.name)
+        if cleanup_failures:
+            raise ProducerError(
+                f"bundle creation failed for {bundle_dir.name}; cleanup incomplete for "
+                f"{', '.join(cleanup_failures)}; inspect that output directory"
+            ) from exc
         raise
 
     result = {
@@ -1008,6 +1100,34 @@ def build_bundle(
         "acquired_at_utc": source.acquired_at_utc,
     }
     return bundle_dir, result, projected_bounds
+
+
+def _remove_generated_bundle(
+    bundle_dir: Path,
+    expected_result: dict[str, Any],
+    expected_manifest_sha256: str | None,
+    schema_path: Path,
+) -> None:
+    """Remove only a complete bundle proven to match this invocation's output."""
+    manifest = validate_bundle(bundle_dir, schema_path)
+    manifest_sha256, _manifest_size = sha256_file(
+        bundle_dir / "manifest.json", max_bytes=MANIFEST_LIMIT_BYTES
+    )
+    if (
+        expected_manifest_sha256 is None
+        or manifest_sha256 != expected_manifest_sha256
+        or manifest["artifact_id"] != expected_result["artifact_id"]
+        or manifest["payloads"]["horizontal_xy"]["sha256"]
+        != expected_result["horizontal_payload_sha256"]
+        or manifest["payloads"]["height_samples"]["sha256"]
+        != expected_result["height_payload_sha256"]
+    ):
+        raise ProducerError(
+            f"preserving output directory {bundle_dir.name} because it changed after generation"
+        )
+    for filename in ("manifest.json", "horizontal_xy.f64le", "height_samples.f32le"):
+        (bundle_dir / filename).unlink()
+    bundle_dir.rmdir()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1040,18 +1160,45 @@ def main(argv: list[str] | None = None) -> int:
         producer_commit = _producer_commit()
         selected = list(REGIONS.values()) if args.region == "both" else [REGIONS[args.region]]
         results = []
-        for spec in selected:
-            _bundle_dir, result, projected_bounds = build_bundle(
-                spec,
-                args.source_dir,
-                args.ledger,
-                args.schema,
-                args.output_root,
-                producer_commit,
-            )
-            result["projected_sample_bounds_m"] = projected_bounds
-            results.append(result)
-        print(json.dumps(results, indent=2, sort_keys=True))
+        generated: list[tuple[Path, dict[str, Any], str | None]] = []
+        try:
+            for spec in selected:
+                bundle_dir, result, projected_bounds = build_bundle(
+                    spec,
+                    args.source_dir,
+                    args.ledger,
+                    args.schema,
+                    args.output_root,
+                    producer_commit,
+                )
+                generated.append((bundle_dir, result, None))
+                manifest_sha256, _manifest_size = sha256_file(
+                    bundle_dir / "manifest.json", max_bytes=MANIFEST_LIMIT_BYTES
+                )
+                generated[-1] = (bundle_dir, result, manifest_sha256)
+                result["projected_sample_bounds_m"] = projected_bounds
+                results.append(result)
+            print(json.dumps(results, indent=2, sort_keys=True))
+        except BaseException as exc:
+            rollback_failures: list[str] = []
+            for bundle_dir, result, manifest_sha256 in reversed(generated):
+                try:
+                    _remove_generated_bundle(
+                        bundle_dir, result, manifest_sha256, args.schema
+                    )
+                except (OSError, ProducerError, ValueError, KeyError, struct.error):
+                    rollback_failures.append(bundle_dir.name)
+            if rollback_failures:
+                raise ProducerError(
+                    f"generation failed: {exc}; rollback incomplete, preserved output(s): "
+                    f"{', '.join(rollback_failures)}"
+                ) from exc
+            if generated and isinstance(exc, Exception):
+                raise ProducerError(
+                    f"generation failed: {exc}; rolled back "
+                    f"{len(generated)} newly created bundle(s)"
+                ) from exc
+            raise
     except (ProducerError, OSError, ValueError, KeyError, struct.error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
