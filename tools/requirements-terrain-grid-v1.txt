@@ -1,0 +1,4 @@
+# Standalone WF-VS-01 terrain-grid producer and its focused functional tests.
+jsonschema==4.26.0
+numpy==2.5.3
+rasterio==1.5.2
