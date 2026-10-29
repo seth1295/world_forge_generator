@@ -460,6 +460,116 @@ class TerrainGridV1Tests(unittest.TestCase):
                         with self.assertRaisesRegex(producer.ProducerError, expected_error):
                             producer.validate_bundle(bundle, SCHEMA_PATH)
 
+    def test_bundle_validation_uses_hashed_buffer_after_payload_changes_on_disk(self) -> None:
+        with _temporary_directory() as temporary_directory:
+            bundle = Path(temporary_directory) / "bundle"
+            shutil.copytree(EXAMPLE_DIR, bundle)
+            payload_path = bundle / "height_samples.f32le"
+            original_payload = payload_path.read_bytes()
+            invalid_payload = (
+                np.asarray([np.nan], dtype="<f4").tobytes() + original_payload[4:]
+            )
+            self.assertEqual(len(invalid_payload), len(original_payload))
+            original_manifest = producer.load_json_unique(bundle / "manifest.json")
+            real_open = Path.open
+            height_open_count = 0
+            mutation = {"completed": False}
+
+            class MutateAfterClose:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    close_result = self.handle.__exit__(exc_type, exc_value, traceback)
+                    with real_open(payload_path, "r+b") as output:
+                        output.write(invalid_payload)
+                    mutation["completed"] = True
+                    return close_result
+
+                def fileno(self):
+                    return self.handle.fileno()
+
+                def read(self, size=-1):
+                    return self.handle.read(size)
+
+            def mutate_after_payload_close(path, mode="r", *args, **kwargs):
+                nonlocal height_open_count
+                handle = real_open(path, mode, *args, **kwargs)
+                if path == payload_path and mode == "rb":
+                    height_open_count += 1
+                    if height_open_count == 1:
+                        return MutateAfterClose(handle)
+                return handle
+
+            with mock.patch.object(Path, "open", new=mutate_after_payload_close):
+                validated = producer.validate_bundle(bundle, SCHEMA_PATH)
+
+            self.assertTrue(mutation["completed"])
+            self.assertEqual(height_open_count, 1)
+            self.assertEqual(validated["artifact_id"], original_manifest["artifact_id"])
+            self.assertEqual(payload_path.read_bytes(), invalid_payload)
+
+    def test_manifest_payload_reader_rejects_invalid_metadata_before_open(self) -> None:
+        example_manifest = producer.load_json_unique(EXAMPLE_DIR / "manifest.json")
+
+        cases = (
+            ("missing payload", lambda m: m["payloads"].pop("horizontal_xy")),
+            ("missing grid rows", lambda m: m["grid"].pop("rows")),
+            (
+                "missing byte length",
+                lambda m: m["payloads"]["horizontal_xy"].pop("byte_length"),
+            ),
+            (
+                "missing digest",
+                lambda m: m["payloads"]["horizontal_xy"].pop("sha256"),
+            ),
+            ("boolean rows", lambda m: m["grid"].__setitem__("rows", True)),
+            ("noninteger columns", lambda m: m["grid"].__setitem__("columns", 2.5)),
+            ("too few rows", lambda m: m["grid"].__setitem__("rows", 1)),
+            ("too few columns", lambda m: m["grid"].__setitem__("columns", 1)),
+            ("rows above v1 limit", lambda m: m["grid"].__setitem__("rows", 4097)),
+            ("columns above v1 limit", lambda m: m["grid"].__setitem__("columns", 4097)),
+            (
+                "sample count above v1 limit",
+                lambda m: (
+                    m["grid"].__setitem__("rows", 4096),
+                    m["grid"].__setitem__("columns", 1025),
+                ),
+            ),
+            (
+                "boolean byte length",
+                lambda m: m["payloads"]["horizontal_xy"].__setitem__("byte_length", True),
+            ),
+            (
+                "inconsistent byte length",
+                lambda m: m["payloads"]["horizontal_xy"].__setitem__("byte_length", 63),
+            ),
+            (
+                "oversized byte length",
+                lambda m: m["payloads"]["horizontal_xy"].__setitem__(
+                    "byte_length", producer.MAX_SAMPLES * 16 + 1
+                ),
+            ),
+        )
+        for name, corrupt_metadata in cases:
+            with self.subTest(metadata=name):
+                manifest = json.loads(json.dumps(example_manifest))
+                corrupt_metadata(manifest)
+                with mock.patch.object(Path, "open") as open_file:
+                    with self.assertRaises(producer.ProducerError):
+                        producer._read_manifest_payload_bytes(
+                            Path("missing-bundle"),
+                            manifest,
+                            "horizontal_xy",
+                            "horizontal_xy.f64le",
+                            16,
+                            purpose="metadata test",
+                        )
+                open_file.assert_not_called()
+
     def test_rejects_duplicate_json_keys_and_invalid_height_samples(self) -> None:
         with self.assertRaises(producer.ProducerError):
             producer._reject_duplicate_pairs([("a", 1), ("a", 2)])

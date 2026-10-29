@@ -1168,12 +1168,23 @@ def _read_manifest_payload_bytes(
         or type(columns) is not int
         or rows < 2
         or columns < 2
+        or rows > 4096
+        or columns > 4096
         or rows > MAX_SAMPLES // columns
-        or type(expected_length) is not int
-        or expected_length != rows * columns * bytes_per_sample
+    ):
+        raise ProducerError(f"invalid {payload_key} grid dimensions")
+    if (
+        type(expected_length) is not int
+        or expected_length < 1
         or expected_length > MAX_SAMPLES * bytes_per_sample
     ):
+        raise ProducerError(f"invalid {payload_key} payload byte length")
+    if expected_length != rows * columns * bytes_per_sample:
         raise ProducerError(f"invalid {payload_key} payload length")
+    if not isinstance(expected_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ):
+        raise ProducerError(f"invalid {payload_key} payload SHA-256")
 
     path = bundle_dir / filename
     try:
