@@ -1090,24 +1090,23 @@ def validate_bundle(bundle_dir: Path, schema_path: Path) -> dict[str, Any]:
         raise ProducerError("H0 is outside the v1 source-height limit")
 
     payload_specs = (
-        ("horizontal_xy", "horizontal_xy.f64le", rows * columns * 16),
-        ("height_samples", "height_samples.f32le", rows * columns * 4),
+        ("horizontal_xy", "horizontal_xy.f64le", 16),
+        ("height_samples", "height_samples.f32le", 4),
     )
     payload_bytes: dict[str, bytes] = {}
-    for key, filename, expected_length in payload_specs:
+    for key, filename, bytes_per_sample in payload_specs:
+        expected_length = rows * columns * bytes_per_sample
         payload = manifest["payloads"][key]
         if payload["path"] != filename or payload["byte_length"] != expected_length:
             raise ProducerError(f"payload length or fixed path mismatch for {filename}")
-        path = bundle_dir / filename
-        try:
-            if path.stat().st_size != expected_length:
-                raise ProducerError(f"payload byte length mismatch for {filename}")
-            actual_hash, actual_size = sha256_file(path, max_bytes=expected_length)
-            if actual_size != expected_length or actual_hash != payload["sha256"]:
-                raise ProducerError(f"payload hash mismatch for {filename}")
-            payload_bytes[key] = path.read_bytes()
-        except OSError as exc:
-            raise ProducerError(f"cannot read bundle payload {filename}: {exc}") from exc
+        payload_bytes[key] = _read_manifest_payload_bytes(
+            bundle_dir,
+            manifest,
+            key,
+            filename,
+            bytes_per_sample,
+            purpose="bundle validation",
+        )
 
     horizontal = np.frombuffer(payload_bytes["horizontal_xy"], dtype="<f8").reshape(
         rows * columns, 2
@@ -1145,14 +1144,16 @@ def _validate_shared_column_bytes(
             raise ProducerError(f"adjacent tile shared {label} differs at row {row}")
 
 
-def _read_manifest_payload_for_seam(
+def _read_manifest_payload_bytes(
     bundle_dir: Path,
     manifest: dict[str, Any],
     payload_key: str,
     filename: str,
     bytes_per_sample: int,
+    *,
+    purpose: str,
 ) -> bytes:
-    """Read bounded bytes and authenticate the exact content used for seam checks."""
+    """Read bounded bytes and authenticate the exact content used by the caller."""
     try:
         rows = manifest["grid"]["rows"]
         columns = manifest["grid"]["columns"]
@@ -1160,7 +1161,7 @@ def _read_manifest_payload_for_seam(
         expected_length = payload["byte_length"]
         expected_sha256 = payload["sha256"]
     except (KeyError, TypeError) as exc:
-        raise ProducerError(f"missing {payload_key} seam payload metadata") from exc
+        raise ProducerError(f"missing {payload_key} payload metadata") from exc
 
     if (
         type(rows) is not int
@@ -1172,7 +1173,7 @@ def _read_manifest_payload_for_seam(
         or expected_length != rows * columns * bytes_per_sample
         or expected_length > MAX_SAMPLES * bytes_per_sample
     ):
-        raise ProducerError(f"invalid {payload_key} seam payload length")
+        raise ProducerError(f"invalid {payload_key} payload length")
 
     path = bundle_dir / filename
     try:
@@ -1180,7 +1181,7 @@ def _read_manifest_payload_for_seam(
         with path.open("rb") as payload_file:
             if os.fstat(payload_file.fileno()).st_size != expected_length:
                 raise ProducerError(
-                    f"payload byte length changed during seam validation for {filename}"
+                    f"payload byte length changed during {purpose} for {filename}"
                 )
             # The v1 sample cap bounds this read to 64 MiB + 1 byte for XY or
             # 16 MiB + 1 byte for heights; the extra byte detects post-fstat growth.
@@ -1188,14 +1189,14 @@ def _read_manifest_payload_for_seam(
     except ProducerError:
         raise
     except OSError as exc:
-        raise ProducerError(f"cannot read seam payload {filename}: {exc}") from exc
+        raise ProducerError(f"cannot read payload {filename}: {exc}") from exc
 
     if len(payload_bytes) != expected_length:
         raise ProducerError(
-            f"payload byte length changed during seam validation for {filename}"
+            f"payload byte length changed during {purpose} for {filename}"
         )
     if hashlib.sha256(payload_bytes).hexdigest() != expected_sha256:
-        raise ProducerError(f"payload SHA-256 mismatch during seam validation for {filename}")
+        raise ProducerError(f"payload SHA-256 mismatch during {purpose} for {filename}")
     return payload_bytes
 
 
@@ -1235,17 +1236,37 @@ def validate_adjacent_tile_bundles(
     east_row, _east_column, east_rows, east_columns = east_spec.source_window
     if west_row != east_row or rows != east_rows:
         raise ProducerError("adjacent tile manifests do not have matching row ranges")
-    west_xy = _read_manifest_payload_for_seam(
-        west_bundle, west, "horizontal_xy", "horizontal_xy.f64le", 16
+    west_xy = _read_manifest_payload_bytes(
+        west_bundle,
+        west,
+        "horizontal_xy",
+        "horizontal_xy.f64le",
+        16,
+        purpose="seam validation",
     )
-    east_xy = _read_manifest_payload_for_seam(
-        east_bundle, east, "horizontal_xy", "horizontal_xy.f64le", 16
+    east_xy = _read_manifest_payload_bytes(
+        east_bundle,
+        east,
+        "horizontal_xy",
+        "horizontal_xy.f64le",
+        16,
+        purpose="seam validation",
     )
-    west_heights = _read_manifest_payload_for_seam(
-        west_bundle, west, "height_samples", "height_samples.f32le", 4
+    west_heights = _read_manifest_payload_bytes(
+        west_bundle,
+        west,
+        "height_samples",
+        "height_samples.f32le",
+        4,
+        purpose="seam validation",
     )
-    east_heights = _read_manifest_payload_for_seam(
-        east_bundle, east, "height_samples", "height_samples.f32le", 4
+    east_heights = _read_manifest_payload_bytes(
+        east_bundle,
+        east,
+        "height_samples",
+        "height_samples.f32le",
+        4,
+        purpose="seam validation",
     )
     _validate_shared_column_bytes(
         west_xy, east_xy, rows, west_columns, east_columns, 16, "Float64 XY"

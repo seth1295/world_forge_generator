@@ -402,6 +402,64 @@ class TerrainGridV1Tests(unittest.TestCase):
         self.assertEqual(len(horizontal), 64)
         self.assertEqual(len(heights), 16)
 
+    def test_bundle_validation_rejects_mutated_and_oversized_payload_reads(self) -> None:
+        with _temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            real_open = Path.open
+
+            for mutation, expected_error in (
+                (
+                    "same-size",
+                    "payload SHA-256 mismatch during bundle validation",
+                ),
+                (
+                    "oversize",
+                    "payload byte length changed during bundle validation",
+                ),
+            ):
+                with self.subTest(payload_read_mutation=mutation):
+                    bundle = root / mutation
+                    shutil.copytree(EXAMPLE_DIR, bundle)
+                    payload_path = bundle / "height_samples.f32le"
+                    original_payload = payload_path.read_bytes()
+
+                    class MutatingReader:
+                        def __init__(self, handle):
+                            self.handle = handle
+                            self.mutated = False
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, exc_type, exc_value, traceback):
+                            return self.handle.__exit__(exc_type, exc_value, traceback)
+
+                        def fileno(self):
+                            return self.handle.fileno()
+
+                        def read(self, size=-1):
+                            if not self.mutated:
+                                self.mutated = True
+                                if mutation == "same-size":
+                                    changed = bytearray(original_payload)
+                                    changed[0] ^= 0x01
+                                    with real_open(payload_path, "r+b") as output:
+                                        output.write(changed)
+                                else:
+                                    with real_open(payload_path, "ab") as output:
+                                        output.write(b"\x00")
+                            return self.handle.read(size)
+
+                    def mutate_after_size_check(path, mode="r", *args, **kwargs):
+                        handle = real_open(path, mode, *args, **kwargs)
+                        if path == payload_path and mode == "rb":
+                            return MutatingReader(handle)
+                        return handle
+
+                    with mock.patch.object(Path, "open", new=mutate_after_size_check):
+                        with self.assertRaisesRegex(producer.ProducerError, expected_error):
+                            producer.validate_bundle(bundle, SCHEMA_PATH)
+
     def test_rejects_duplicate_json_keys_and_invalid_height_samples(self) -> None:
         with self.assertRaises(producer.ProducerError):
             producer._reject_duplicate_pairs([("a", 1), ("a", 2)])
@@ -1063,7 +1121,9 @@ class TerrainGridV1Tests(unittest.TestCase):
             payload = bundle_dir / "height_samples.f32le"
             with payload.open("ab") as output:
                 output.write(b"x")
-            with self.assertRaisesRegex(producer.ProducerError, "payload byte length mismatch"):
+            with self.assertRaisesRegex(
+                producer.ProducerError, "payload byte length changed during bundle validation"
+            ):
                 producer.validate_bundle(bundle_dir, SCHEMA_PATH)
 
     def test_real_bundle_integrity_source_bits_and_independent_geodesy(self) -> None:
