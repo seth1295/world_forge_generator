@@ -6,12 +6,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import rasterio
@@ -188,6 +194,113 @@ def _test_paths() -> tuple[Path, Path, Path | None, Path | None]:
 
 
 SCHEMA_PATH, EXAMPLE_DIR, REAL_BUNDLE_ROOT, SOURCE_DIR = _test_paths()
+FIXTURE_RECEIPT = "2026-10-29T00:00:00Z"
+FIXTURE_COMMIT = "a" * 40
+
+
+def _small_fixture(
+    key: str, anchor_lon: float, anchor_lat: float, height_base: float
+) -> tuple[producer.RegionSpec, producer.VerifiedSource, np.ndarray, float]:
+    spec = producer.RegionSpec(
+        key=key,
+        region_id=f"wf-vs01:{key}",
+        frame_id=f"wf-vs01:{key}-grs80-aeqd",
+        raster_name=f"{key}.tif",
+        xml_name=f"{key}.xml",
+        record_name=f"{key}-record.json",
+        product_id=f"WorldForge local fixture {key}",
+        product_date="2026-10-29",
+        source_window=(0, 0, 2, 2),
+        anchor_row=0,
+        anchor_column=0,
+        anchor_lon=anchor_lon,
+        anchor_lat=anchor_lat,
+        ledger_h0=height_base,
+        ledger_crop_bounds=(
+            anchor_lon - 0.01,
+            anchor_lat - 0.01,
+            anchor_lon + 0.01,
+            anchor_lat + 0.01,
+        ),
+    )
+    samples = np.asarray(
+        [[height_base, height_base + 0.25], [height_base + 0.5, height_base + 0.75]],
+        dtype=np.float32,
+    )
+    base_uri = f"https://example.invalid/worldforge/{key}"
+    record = {
+        "title": spec.product_id,
+        "publicationDate": spec.product_date,
+        "sizeInBytes": 128,
+        "format": "GeoTIFF",
+        "downloadURL": f"{base_uri}.tif",
+        "vendorMetaUrl": f"{base_uri}.xml",
+        "metaUrl": f"{base_uri}.json",
+    }
+    source = producer.VerifiedSource(
+        raster_path=Path(spec.raster_name),
+        xml_path=Path(spec.xml_name),
+        record_path=Path(spec.record_name),
+        raster_sha256=hashlib.sha256(f"{key}-raster".encode()).hexdigest(),
+        xml_sha256=hashlib.sha256(f"{key}-xml".encode()).hexdigest(),
+        record_sha256=hashlib.sha256(f"{key}-record".encode()).hexdigest(),
+        raster_bytes=128,
+        xml_bytes=256,
+        record_bytes=192,
+        record=record,
+        acquired_at_utc=FIXTURE_RECEIPT,
+        affine=(0.01, 0.0, anchor_lon - 0.005, 0.0, -0.01, anchor_lat + 0.005),
+        source_width=2,
+        source_height=2,
+        nodata=producer.NODATA_VALUE,
+        raster_min=float(samples.min()),
+        raster_max=float(samples.max()),
+    )
+    return spec, source, samples, height_base
+
+
+def _small_source_ledger(root: Path, spec: producer.RegionSpec) -> tuple[Path, Path]:
+    source_dir = root / "source-fixture"
+    source_dir.mkdir()
+    raster = b"small raster fixture"
+    xml = (
+        f"<metadata><title>{spec.product_id}</title>"
+        "<horizontal>North American Datum of 1983</horizontal>"
+        "<vertical>North American Vertical Datum of 1988</vertical></metadata>"
+    ).encode()
+    urls = (
+        "https://example.invalid/tile.tif",
+        "https://example.invalid/tile.xml",
+        "https://example.invalid/tile.json",
+    )
+    record = {
+        "title": spec.product_id,
+        "publicationDate": spec.product_date,
+        "sizeInBytes": len(raster),
+        "format": "GeoTIFF",
+        "downloadURL": urls[0],
+        "vendorMetaUrl": urls[1],
+        "metaUrl": urls[2],
+    }
+    record_bytes = json.dumps(record, sort_keys=True).encode()
+    contents = (raster, xml, record_bytes)
+    paths = (spec.raster_name, spec.xml_name, spec.record_name)
+    for name, content in zip(paths, contents, strict=True):
+        (source_dir / name).write_bytes(content)
+    columns = [
+        f"[{label}]({url}); {len(content)} bytes; SHA-256 `{hashlib.sha256(content).hexdigest()}`"
+        for label, url, content in zip(
+            ("GeoTIFF", "XML", "TNM JSON"), urls, contents, strict=True
+        )
+    ]
+    ledger = root / "vertical-slice-fixture.md"
+    ledger.write_text(
+        f"| {spec.product_id} | "
+        + " | ".join(columns)
+        + f" | local snapshot file-creation receipt `{FIXTURE_RECEIPT}` |\n",
+        encoding="utf-8",
+    )
+    return source_dir, ledger
 
 
 class TerrainGridV1Tests(unittest.TestCase):
@@ -242,6 +355,333 @@ class TerrainGridV1Tests(unittest.TestCase):
                 np.asarray([24_001.0], dtype=np.float32), 0.0, "fixture"
             )
 
+    def test_source_sizes_are_bounded_before_hashing_and_receipt_comes_from_ledger(self) -> None:
+        spec = producer.REGIONS["baltimore"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, ledger_path = _small_source_ledger(root, spec)
+            _record, expected, acquired_at_utc = producer._verify_record_and_ledger(
+                source_dir, ledger_path, spec
+            )
+            self.assertEqual(acquired_at_utc, FIXTURE_RECEIPT)
+            self.assertEqual(
+                [size for size, _digest in expected],
+                [
+                    (source_dir / spec.raster_name).stat().st_size,
+                    (source_dir / spec.xml_name).stat().st_size,
+                    (source_dir / spec.record_name).stat().st_size,
+                ],
+            )
+
+            (source_dir / spec.raster_name).write_bytes(b"oversized raster fixture")
+            with mock.patch.object(producer, "sha256_file") as hash_file:
+                with self.assertRaisesRegex(
+                    producer.ProducerError, "size mismatch before hashing"
+                ):
+                    producer._verify_record_and_ledger(source_dir, ledger_path, spec)
+                hash_file.assert_not_called()
+
+            ledger_text = ledger_path.read_text(encoding="utf-8")
+            first_size = expected[0][0]
+            ledger_path.write_text(
+                ledger_text.replace(
+                    f"{first_size} bytes; SHA-256",
+                    f"{producer.MAX_SOURCE_RASTER_BYTES + 1} bytes; SHA-256",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(producer, "sha256_file") as hash_file:
+                with self.assertRaisesRegex(producer.ProducerError, "v1 byte limit"):
+                    producer._verify_record_and_ledger(source_dir, ledger_path, spec)
+                hash_file.assert_not_called()
+
+    def test_producer_commit_rejects_dirty_tracked_and_untracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = Path(temporary_directory)
+            deterministic_env = os.environ.copy()
+            deterministic_env["GIT_AUTHOR_DATE"] = "2026-10-30T00:00:00Z"
+            deterministic_env["GIT_COMMITTER_DATE"] = "2026-10-30T00:00:00Z"
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=deterministic_env,
+                )
+                return completed.stdout.strip()
+
+            git("init", "--quiet")
+            git("config", "user.name", "WorldForge test fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            tracked = repo / "tracked.txt"
+            tracked.write_text("committed\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("commit", "--quiet", "-m", "fixture commit")
+            expected_commit = git("rev-parse", "HEAD")
+            self.assertEqual(producer._producer_commit(repo), expected_commit)
+
+            tracked.write_text("modified\n", encoding="utf-8")
+            with self.assertRaisesRegex(producer.ProducerError, "worktree is dirty"):
+                producer._producer_commit(repo)
+
+            tracked.write_text("committed\n", encoding="utf-8")
+            (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+            with self.assertRaisesRegex(producer.ProducerError, "worktree is dirty"):
+                producer._producer_commit(repo)
+
+    def test_cli_builds_fixture_and_samples_match_declared_grs80_aeqd(self) -> None:
+        spec, source, samples, _h0 = _small_fixture("fixture-one", -76.5, 39.2, 3.0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "output"
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(output_root),
+                "--region", spec.key,
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(producer.REGIONS, {spec.key: spec}, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(
+                    producer,
+                    "_verify_raster_window",
+                    return_value=(source, samples, spec.ledger_h0),
+                ),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result_code = producer.main(args)
+            self.assertEqual(result_code, 0, stderr.getvalue())
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(len(result), 1)
+            bundle_dir = output_root / spec.key
+            manifest = producer.validate_bundle(bundle_dir, SCHEMA_PATH)
+            self.assertEqual(manifest["producer"]["commit"], FIXTURE_COMMIT)
+            self.assertEqual(
+                manifest["source"]["acquisition_time_basis"],
+                "recorded_download_receipt",
+            )
+            self.assertEqual(manifest["source"]["acquired_at_utc"], FIXTURE_RECEIPT)
+            self.assertEqual(manifest["generation"]["created_utc"], FIXTURE_RECEIPT)
+
+            pipeline = manifest["frame"]["horizontal"]["operation_proj_pipeline"]
+            self.assertEqual(
+                pipeline,
+                "+proj=pipeline +step +proj=unitconvert +xy_in=deg +xy_out=rad "
+                f"+step +proj=aeqd +lat_0={spec.anchor_lat!r} +lon_0={spec.anchor_lon!r} "
+                "+ellps=GRS80 +x_0=0 +y_0=0",
+            )
+            xy_bytes = (bundle_dir / "horizontal_xy.f64le").read_bytes()
+            xy = np.frombuffer(xy_bytes, dtype="<f8").reshape(2, 2, 2)
+            pixel_width, _rot_x, x_origin, _rot_y, pixel_height, y_origin = source.affine
+            for row in range(2):
+                for column in range(2):
+                    longitude = x_origin + (column + 0.5) * pixel_width
+                    latitude = y_origin + (row + 0.5) * pixel_height
+                    distance, azimuth = _vincenty_inverse(
+                        spec.anchor_lon, spec.anchor_lat, longitude, latitude
+                    )
+                    self.assertAlmostEqual(
+                        float(xy[row, column, 0]), distance * math.sin(azimuth), delta=1e-5
+                    )
+                    self.assertAlmostEqual(
+                        float(xy[row, column, 1]), distance * math.cos(azimuth), delta=1e-5
+                    )
+
+            repeated_output_root = root / "output-repeat"
+            with (
+                mock.patch.object(
+                    producer,
+                    "_verify_raster_window",
+                    return_value=(source, samples, spec.ledger_h0),
+                ),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+            ):
+                repeated_dir, _repeated_result, _repeated_bounds = producer.build_bundle(
+                    spec,
+                    source_dir,
+                    ledger,
+                    SCHEMA_PATH,
+                    repeated_output_root,
+                    FIXTURE_COMMIT,
+                )
+            for filename in (
+                "manifest.json",
+                "horizontal_xy.f64le",
+                "height_samples.f32le",
+            ):
+                self.assertEqual(
+                    (bundle_dir / filename).read_bytes(),
+                    (repeated_dir / filename).read_bytes(),
+                )
+
+    def test_both_regions_roll_back_new_outputs_and_preserve_existing_user_files(self) -> None:
+        first = _small_fixture("fixture-first", -76.5, 39.2, 3.0)
+        second = _small_fixture("fixture-second", -105.2, 39.7, 100.0)
+        specs = {first[0].key: first[0], second[0].key: second[0]}
+        sources = {first[0].key: first[1:], second[0].key: second[1:]}
+
+        def verify(_source_dir: Path, _ledger: Path, spec: producer.RegionSpec):
+            if spec.key == second[0].key:
+                raise producer.ProducerError("injected later-region failure")
+            return sources[spec.key]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "output"
+            output_root.mkdir()
+            user_file = output_root / "user-owned-note.txt"
+            user_file.write_text("keep this file\n", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(output_root),
+                "--region", "both",
+            ]
+            with (
+                mock.patch.dict(producer.REGIONS, specs, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(producer, "_verify_raster_window", side_effect=verify),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result_code = producer.main(args)
+            self.assertEqual(result_code, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("injected later-region failure", stderr.getvalue())
+            self.assertEqual(sorted(path.name for path in output_root.iterdir()), [user_file.name])
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "keep this file\n")
+
+    def test_partial_payload_write_is_removed_without_touching_other_output(self) -> None:
+        spec, source, samples, _h0 = _small_fixture("fixture-partial", -76.5, 39.2, 3.0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "output"
+            output_root.mkdir()
+            user_file = output_root / "user-owned-note.txt"
+            user_file.write_text("preserve\n", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(output_root),
+                "--region", spec.key,
+            ]
+            real_open = Path.open
+
+            class PartialWriter:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    return self.handle.__exit__(exc_type, exc_value, traceback)
+
+                def write(self, data: bytes) -> int:
+                    self.handle.write(data[:8])
+                    self.handle.flush()
+                    raise OSError("injected partial write")
+
+                def flush(self) -> None:
+                    self.handle.flush()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+            def fail_first_payload(path: Path, mode: str = "r", *args, **kwargs):
+                handle = real_open(path, mode, *args, **kwargs)
+                if path.name == "horizontal_xy.f64le" and mode == "xb":
+                    return PartialWriter(handle)
+                return handle
+
+            with (
+                mock.patch.dict(producer.REGIONS, {spec.key: spec}, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(
+                    producer,
+                    "_verify_raster_window",
+                    return_value=(source, samples, spec.ledger_h0),
+                ),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(Path, "open", new=fail_first_payload),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result_code = producer.main(args)
+            self.assertEqual(result_code, 1)
+            self.assertIn("injected partial write", stderr.getvalue())
+            self.assertEqual(sorted(path.name for path in output_root.iterdir()), [user_file.name])
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_parser_corruption_and_existing_output_fail_without_overwrite(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                producer.parse_args([
+                    "--source-dir", "source",
+                    "--ledger", "ledger.md",
+                    "--schema", str(SCHEMA_PATH),
+                    "--output-root", "output",
+                    "--region", "unknown-region",
+                ])
+
+        spec, source, samples, _h0 = _small_fixture("fixture-existing", -76.5, 39.2, 3.0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "output"
+            args = (spec, source_dir, ledger, SCHEMA_PATH, output_root, FIXTURE_COMMIT)
+            with (
+                mock.patch.object(
+                    producer,
+                    "_verify_raster_window",
+                    return_value=(source, samples, spec.ledger_h0),
+                ),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+            ):
+                bundle_dir, _result, _bounds = producer.build_bundle(*args)
+                original_manifest = (bundle_dir / "manifest.json").read_bytes()
+                with self.assertRaisesRegex(producer.ProducerError, "refusing to overwrite"):
+                    producer.build_bundle(*args)
+                self.assertEqual((bundle_dir / "manifest.json").read_bytes(), original_manifest)
+
+            payload = bundle_dir / "height_samples.f32le"
+            with payload.open("ab") as output:
+                output.write(b"x")
+            with self.assertRaisesRegex(producer.ProducerError, "payload byte length mismatch"):
+                producer.validate_bundle(bundle_dir, SCHEMA_PATH)
+
     def test_real_bundle_integrity_source_bits_and_independent_geodesy(self) -> None:
         if REAL_BUNDLE_ROOT is None or SOURCE_DIR is None:
             self.skipTest("pass --bundles and --source-dir to verify acquired source outputs")
@@ -255,21 +695,20 @@ class TerrainGridV1Tests(unittest.TestCase):
                 manifest = producer.validate_bundle(bundle, SCHEMA_PATH)
                 self.validator.validate(manifest)
                 self.assertEqual(manifest["source"]["product_id"], spec.product_id)
-                self.assertEqual(
-                    manifest["source"]["acquisition_time_basis"],
-                    "filesystem_creation_time",
+                self.assertRegex(
+                    manifest["source"]["acquired_at_utc"],
+                    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
                 )
-                expected_acquired = {
-                    "baltimore": "2026-10-29T13:34:02Z",
-                    "golden": "2026-10-29T13:41:19Z",
-                }[region_key]
-                self.assertEqual(manifest["source"]["acquired_at_utc"], expected_acquired)
                 self.assertNotIn("C:\\", json.dumps(manifest))
                 self.assertTrue(manifest["source"]["source_uri"].startswith("https://"))
                 self.assertEqual(manifest["frame"]["vertical"]["local_up_expression"], "H-H0")
                 pipeline = manifest["frame"]["horizontal"]["operation_proj_pipeline"]
-                self.assertIn("+proj=pipeline", pipeline)
-                self.assertNotIn("WGS84", pipeline.upper())
+                self.assertEqual(
+                    pipeline,
+                    "+proj=pipeline +step +proj=unitconvert +xy_in=deg +xy_out=rad "
+                    f"+step +proj=aeqd +lat_0={spec.anchor_lat!r} +lon_0={spec.anchor_lon!r} "
+                    "+ellps=GRS80 +x_0=0 +y_0=0",
+                )
                 projection_versions.append(manifest["generation"]["tool_versions"]["proj"])
 
                 payload_xy = (bundle / "horizontal_xy.f64le").read_bytes()

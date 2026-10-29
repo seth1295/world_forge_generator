@@ -16,6 +16,23 @@ hashes and lengths from the ledger, checks the TNM record and XML identity,
 validates the full raster metadata, reads only the selected crop windows, and
 refuses to overwrite existing bundle directories.
 
+Before hashing a source file, it validates the ledger byte count against the
+Terrain Grid v1 file-size ceiling and compares that value with the file's
+current length. Hashing is then bounded by the validated expected length. The
+acquisition timestamp comes from the explicit UTC snapshot receipt recorded in
+the supplied ledger row; the current machine's filesystem creation time is not
+used. The manifest uses the v1 `recorded_download_receipt` basis value for that
+receipt.
+
+`--region both` treats the selected bundle outputs as one command result. If a
+later region fails, the command removes complete bundles created earlier by
+that invocation and prints an error without reporting partial success. An
+existing region directory is never overwritten or included in rollback. Each
+bundle also removes only files it successfully opened when a write or
+validation fails; a partial file is tracked as soon as exclusive creation
+succeeds. If cleanup fails or an output changed after creation, the error names
+the preserved region directory so it can be inspected and recovered.
+
 ```powershell
 python tools/terrain_grid_v1.py `
   --source-dir <local-USGS-snapshot-directory> `
@@ -33,7 +50,12 @@ no local source or output paths. Source rasters remain local-only.
 The functional test command validates the parent's synthetic cross-language
 hash vector and, when `--bundles` and `--source-dir` are supplied, both real
 bundles against their source Float32 windows and independent GRS80 geodesic
-checks:
+checks. It also uses small task-scoped temporary fixtures to exercise bundle
+generation through the CLI, parser and corrupted-output rejection, existing
+output preservation, dirty-worktree provenance, bounded source-size checks,
+later-region rollback, partial-write cleanup, and the declared direct AEQD
+operation. These fixture tests use local files only and do not contact a
+network:
 
 ```powershell
 python tools/test_terrain_grid_v1.py `
