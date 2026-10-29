@@ -20,7 +20,7 @@ import re
 import struct
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -67,6 +67,7 @@ class RegionSpec:
     anchor_lat: float
     ledger_h0: float
     ledger_crop_bounds: tuple[float, float, float, float]
+    validation_source_window: tuple[int, int, int, int] | None = None
 
 
 REGIONS: dict[str, RegionSpec] = {
@@ -105,6 +106,105 @@ REGIONS: dict[str, RegionSpec] = {
         ledger_crop_bounds=(-105.2400, 39.7450, -105.2000, 39.7650),
     ),
 }
+
+
+def _validated_window(spec: RegionSpec, label: str) -> tuple[int, int, int, int]:
+    """Return a safe row/column window before any raster read or allocation."""
+    window = spec.source_window
+    if len(window) != 4 or any(type(value) is not int for value in window):
+        raise ProducerError(f"{label} source window must contain four integers")
+    row, column, rows, columns = window
+    if row < 0 or column < 0 or rows < 2 or columns < 2:
+        raise ProducerError(f"{label} source window has negative offsets or too few samples")
+    if row > 99_999 or column > 99_999 or rows > 4096 or columns > 4096:
+        raise ProducerError(f"{label} source window exceeds Terrain Grid v1 limits")
+    if rows > MAX_SAMPLES // columns:
+        raise ProducerError(f"{label} source window exceeds the v1 sample cap")
+    return window
+
+
+def validate_adjacent_tile_specs(
+    parent: RegionSpec, west: RegionSpec, east: RegionSpec
+) -> None:
+    """Require two windows to cover one parent window with exactly one shared column."""
+    parent_row, parent_column, parent_rows, parent_columns = _validated_window(
+        parent, "parent"
+    )
+    west_row, west_column, west_rows, west_columns = _validated_window(west, "west tile")
+    east_row, east_column, east_rows, east_columns = _validated_window(east, "east tile")
+
+    for tile, label in ((west, "west tile"), (east, "east tile")):
+        if tile.region_id != parent.region_id or tile.frame_id != parent.frame_id:
+            raise ProducerError(f"{label} must retain the parent region and frame identity")
+        if tile.validation_source_window != parent.source_window:
+            raise ProducerError(f"{label} must validate against the complete parent crop")
+        if (
+            tile.raster_name != parent.raster_name
+            or tile.xml_name != parent.xml_name
+            or tile.record_name != parent.record_name
+            or tile.product_id != parent.product_id
+            or tile.product_date != parent.product_date
+            or tile.anchor_row != parent.anchor_row
+            or tile.anchor_column != parent.anchor_column
+            or tile.anchor_lon != parent.anchor_lon
+            or tile.anchor_lat != parent.anchor_lat
+            or tile.ledger_h0 != parent.ledger_h0
+            or tile.ledger_crop_bounds != parent.ledger_crop_bounds
+        ):
+            raise ProducerError(f"{label} source or regional origin differs from the parent")
+        tile_row, tile_column, tile_rows, tile_columns = _validated_window(tile, label)
+        if (
+            tile_row < parent_row
+            or tile_column < parent_column
+            or tile_row + tile_rows > parent_row + parent_rows
+            or tile_column + tile_columns > parent_column + parent_columns
+        ):
+            raise ProducerError(f"{label} lies outside the parent source window")
+    if (
+        west_row != parent_row
+        or east_row != parent_row
+        or west_rows != parent_rows
+        or east_rows != parent_rows
+    ):
+        raise ProducerError("adjacent tiles must use the same complete parent row range")
+    if west_column != parent_column:
+        raise ProducerError("west tile must start at the parent window's first column")
+    if east_column != west_column + west_columns - 1:
+        raise ProducerError("adjacent tile windows must share exactly one boundary column")
+    if east_column + east_columns != parent_column + parent_columns:
+        raise ProducerError("east tile must end at the parent window's final column")
+    for tile, label in ((west, "west tile"), (east, "east tile")):
+        tile_row, tile_column, tile_rows, tile_columns = tile.source_window
+        if not (tile_row <= parent.anchor_row < tile_row + tile_rows):
+            raise ProducerError(f"{label} does not contain the regional anchor row")
+        if not (tile_column <= parent.anchor_column < tile_column + tile_columns):
+            raise ProducerError(f"{label} does not contain the shared anchor column")
+
+
+def golden_adjacent_tile_specs(
+    parent: RegionSpec | None = None,
+) -> tuple[RegionSpec, RegionSpec]:
+    """Split the selected Golden crop into west/east sample windows with one shared column."""
+    parent = REGIONS["golden"] if parent is None else parent
+    row, column, rows, columns = parent.source_window
+    if columns < 4:
+        raise ProducerError("Golden crop is too narrow to create two v1 terrain tiles")
+    seam_offset = columns // 2
+    west_columns = seam_offset + 1
+    east = replace(
+        parent,
+        key="golden-east",
+        source_window=(row, column + seam_offset, rows, columns - seam_offset),
+        validation_source_window=parent.source_window,
+    )
+    west = replace(
+        parent,
+        key="golden-west",
+        source_window=(row, column, rows, west_columns),
+        validation_source_window=parent.source_window,
+    )
+    validate_adjacent_tile_specs(parent, west, east)
+    return west, east
 
 
 class ProducerError(RuntimeError):
@@ -370,11 +470,32 @@ def _verify_raster_window(
                 raise ProducerError(f"rotated source rasters are not supported for {spec.key}")
             if transform_affine.a <= 0.0 or transform_affine.e >= 0.0:
                 raise ProducerError(f"source raster must be north-up for {spec.key}")
-            row_offset, column_offset, rows, columns = spec.source_window
-            if rows > MAX_SAMPLES // columns:
-                raise ProducerError("source window exceeds the v1 sample cap")
+            row_offset, column_offset, rows, columns = _validated_window(spec, spec.key)
             if row_offset + rows > dataset.height or column_offset + columns > dataset.width:
                 raise ProducerError(f"source window exceeds raster dimensions for {spec.key}")
+            validation_spec = replace(
+                spec,
+                source_window=spec.validation_source_window or spec.source_window,
+                validation_source_window=None,
+            )
+            (
+                validation_row,
+                validation_column,
+                validation_rows,
+                validation_columns,
+            ) = _validated_window(validation_spec, f"{spec.key} validation")
+            if (
+                row_offset < validation_row
+                or column_offset < validation_column
+                or row_offset + rows > validation_row + validation_rows
+                or column_offset + columns > validation_column + validation_columns
+            ):
+                raise ProducerError(f"source window lies outside approved crop for {spec.key}")
+            if (
+                validation_row + validation_rows > dataset.height
+                or validation_column + validation_columns > dataset.width
+            ):
+                raise ProducerError(f"approved crop exceeds raster dimensions for {spec.key}")
             window = Window(column_offset, row_offset, columns, rows)
             samples = dataset.read(1, window=window, masked=False)
             if samples.dtype != np.dtype("float32") or samples.shape != (rows, columns):
@@ -426,8 +547,14 @@ def _verify_raster_window(
                 )
 
             expected_crop = spec.ledger_crop_bounds
-            west, south = transform_affine * (column_offset, row_offset + rows)
-            east, north = transform_affine * (column_offset + columns, row_offset)
+            west, south = transform_affine * (
+                validation_column,
+                validation_row + validation_rows,
+            )
+            east, north = transform_affine * (
+                validation_column + validation_columns,
+                validation_row,
+            )
             derived_crop = (west, south, east, north)
             if not all(
                 math.isclose(actual, expected_value, rel_tol=0.0, abs_tol=1.1e-4)
@@ -999,6 +1126,74 @@ def validate_bundle(bundle_dir: Path, schema_path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _validate_shared_column_bytes(
+    west_payload: bytes,
+    east_payload: bytes,
+    rows: int,
+    west_columns: int,
+    east_columns: int,
+    bytes_per_sample: int,
+    label: str,
+) -> None:
+    for row in range(rows):
+        west_start = (row * west_columns + west_columns - 1) * bytes_per_sample
+        east_start = row * east_columns * bytes_per_sample
+        if (
+            west_payload[west_start : west_start + bytes_per_sample]
+            != east_payload[east_start : east_start + bytes_per_sample]
+        ):
+            raise ProducerError(f"adjacent tile shared {label} differs at row {row}")
+
+
+def validate_adjacent_tile_bundles(
+    parent: RegionSpec,
+    west_spec: RegionSpec,
+    east_spec: RegionSpec,
+    west_bundle: Path,
+    east_bundle: Path,
+    schema_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate v1 bundles and exact shared-frame, coordinate, and height seam bytes."""
+    validate_adjacent_tile_specs(parent, west_spec, east_spec)
+    west = validate_bundle(west_bundle, schema_path)
+    east = validate_bundle(east_bundle, schema_path)
+    if west["frame"] != east["frame"]:
+        raise ProducerError("adjacent tile manifests do not have identical frame definitions")
+    if west["frame_definition_sha256"] != east["frame_definition_sha256"]:
+        raise ProducerError("adjacent tile frame definition hashes differ")
+    if west["source"] != east["source"]:
+        raise ProducerError("adjacent tiles do not identify the same verified source")
+    if west["grid"]["region_id"] != east["grid"]["region_id"]:
+        raise ProducerError("adjacent tile region identities differ")
+
+    for manifest, spec in ((west, west_spec), (east, east_spec)):
+        row, column, rows, columns = spec.source_window
+        expected_window = {
+            "row_offset": row,
+            "column_offset": column,
+            "rows": rows,
+            "columns": columns,
+        }
+        if manifest["grid"]["source_window"] != expected_window:
+            raise ProducerError(f"tile {spec.key} manifest window differs from its specification")
+
+    west_row, _west_column, rows, west_columns = west_spec.source_window
+    east_row, _east_column, east_rows, east_columns = east_spec.source_window
+    if west_row != east_row or rows != east_rows:
+        raise ProducerError("adjacent tile manifests do not have matching row ranges")
+    west_xy = (west_bundle / "horizontal_xy.f64le").read_bytes()
+    east_xy = (east_bundle / "horizontal_xy.f64le").read_bytes()
+    west_heights = (west_bundle / "height_samples.f32le").read_bytes()
+    east_heights = (east_bundle / "height_samples.f32le").read_bytes()
+    _validate_shared_column_bytes(
+        west_xy, east_xy, rows, west_columns, east_columns, 16, "Float64 XY"
+    )
+    _validate_shared_column_bytes(
+        west_heights, east_heights, rows, west_columns, east_columns, 4, "NAVD88 height"
+    )
+    return west, east
+
+
 def build_bundle(
     spec: RegionSpec,
     source_dir: Path,
@@ -1147,7 +1342,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-root", required=True, type=Path, help="directory for new bundle subdirectories"
     )
-    parser.add_argument("--region", choices=["both", *REGIONS], default="both")
+    parser.add_argument(
+        "--region", choices=["both", *REGIONS, "golden-tiles"], default="both"
+    )
     return parser.parse_args(argv)
 
 
@@ -1158,7 +1355,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         producer_commit = _producer_commit()
-        selected = list(REGIONS.values()) if args.region == "both" else [REGIONS[args.region]]
+        if args.region == "both":
+            selected = list(REGIONS.values())
+        elif args.region == "golden-tiles":
+            selected = list(golden_adjacent_tile_specs())
+        else:
+            selected = [REGIONS[args.region]]
         results = []
         generated: list[tuple[Path, dict[str, Any], str | None]] = []
         try:
@@ -1178,6 +1380,15 @@ def main(argv: list[str] | None = None) -> int:
                 generated[-1] = (bundle_dir, result, manifest_sha256)
                 result["projected_sample_bounds_m"] = projected_bounds
                 results.append(result)
+            if args.region == "golden-tiles":
+                validate_adjacent_tile_bundles(
+                    REGIONS["golden"],
+                    selected[0],
+                    selected[1],
+                    generated[0][0],
+                    generated[1][0],
+                    args.schema,
+                )
             print(json.dumps(results, indent=2, sort_keys=True))
         except BaseException as exc:
             rollback_failures: list[str] = []

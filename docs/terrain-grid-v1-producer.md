@@ -1,11 +1,13 @@
 # WF Terrain Grid v1 Producer Pilot
 
 The standalone `tools/terrain_grid_v1.py` command builds the two approved WF-VS-01
-USGS 3DEP source windows without importing or launching the legacy BeamNG server,
-game, Lua hooks, or BeamNG asset formats. It is a source-specific pre-production
-pilot, not a general DEM tiler. The source windows and their public acquisition
-records are selected by the Main Lead and recorded in the WorldForge integration
-repository's `docs/preproduction/vertical-slice.md`.
+USGS 3DEP source windows and can additionally emit the adjacent Golden tiles,
+without importing or launching the legacy BeamNG server, game, Lua hooks, or
+BeamNG asset formats. It is a source-specific pre-production pilot, not a
+general DEM tiler. The source windows and their public acquisition records are
+selected by the Main Lead and recorded in the WorldForge integration
+repository's `docs/preproduction/vertical-slice.md`. The Golden split and seam
+semantics are documented in [terrain-grid-v1-adjacent-golden.md](terrain-grid-v1-adjacent-golden.md).
 
 ## Reproduction
 

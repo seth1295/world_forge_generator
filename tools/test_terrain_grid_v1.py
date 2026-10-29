@@ -7,15 +7,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import hashlib
 import io
 import json
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Iterator
+import uuid
 import unittest
 from unittest import mock
 
@@ -198,6 +202,26 @@ FIXTURE_RECEIPT = "2026-10-29T00:00:00Z"
 FIXTURE_COMMIT = "a" * 40
 
 
+@contextlib.contextmanager
+def _temporary_directory(prefix: str = "terrain-grid-v1-") -> Iterator[str]:
+    """Use the OS temp root or a caller-provided task-local root for sandboxed runs."""
+    configured_root = os.environ.get("WF_TEST_TEMP_ROOT")
+    if configured_root is None:
+        with tempfile.TemporaryDirectory(prefix=prefix) as temporary_directory:
+            yield temporary_directory
+        return
+
+    root = Path(configured_root)
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError("WF_TEST_TEMP_ROOT must name an existing regular directory")
+    temporary_directory = root / f"{prefix}{uuid.uuid4().hex}"
+    temporary_directory.mkdir()
+    try:
+        yield str(temporary_directory)
+    finally:
+        shutil.rmtree(temporary_directory)
+
+
 def _small_fixture(
     key: str, anchor_lon: float, anchor_lat: float, height_base: float
 ) -> tuple[producer.RegionSpec, producer.VerifiedSource, np.ndarray, float]:
@@ -303,6 +327,50 @@ def _small_source_ledger(root: Path, spec: producer.RegionSpec) -> tuple[Path, P
     return source_dir, ledger
 
 
+def _small_adjacent_fixture() -> tuple[
+    producer.RegionSpec, producer.VerifiedSource, np.ndarray, float
+]:
+    base, source, _base_samples, _base_h0 = _small_fixture(
+        "golden", -105.2, 39.7, 10.0
+    )
+    samples = np.asarray(
+        [
+            [10.0, 10.25, 10.5, 10.75],
+            [11.0, 11.25, 11.5, 11.75],
+        ],
+        dtype=np.float32,
+    )
+    affine_x, _rot_x, x_origin, _rot_y, pixel_height, y_origin = source.affine
+    anchor_lon = x_origin + (2 + 0.5) * affine_x
+    anchor_lat = y_origin + 0.5 * pixel_height
+    ledger_crop_bounds = (
+        x_origin,
+        y_origin + 2 * pixel_height,
+        x_origin + 4 * affine_x,
+        y_origin,
+    )
+    h0 = float(samples[0, 2])
+    parent = replace(
+        base,
+        region_id="wf-vs01:golden-fixture",
+        frame_id="wf-vs01:golden-fixture-grs80-aeqd",
+        source_window=(0, 0, 2, 4),
+        anchor_column=2,
+        anchor_lon=anchor_lon,
+        anchor_lat=anchor_lat,
+        ledger_h0=h0,
+        ledger_crop_bounds=ledger_crop_bounds,
+    )
+    source = replace(
+        source,
+        source_width=4,
+        source_height=2,
+        raster_min=float(samples.min()),
+        raster_max=float(samples.max()),
+    )
+    return parent, source, samples, h0
+
+
 class TerrainGridV1Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -357,7 +425,7 @@ class TerrainGridV1Tests(unittest.TestCase):
 
     def test_source_sizes_are_bounded_before_hashing_and_receipt_comes_from_ledger(self) -> None:
         spec = producer.REGIONS["baltimore"]
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir, ledger_path = _small_source_ledger(root, spec)
             _record, expected, acquired_at_utc = producer._verify_record_and_ledger(
@@ -396,46 +464,40 @@ class TerrainGridV1Tests(unittest.TestCase):
                     producer._verify_record_and_ledger(source_dir, ledger_path, spec)
                 hash_file.assert_not_called()
 
-    def test_producer_commit_rejects_dirty_tracked_and_untracked_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            repo = Path(temporary_directory)
-            deterministic_env = os.environ.copy()
-            deterministic_env["GIT_AUTHOR_DATE"] = "2026-10-30T00:00:00Z"
-            deterministic_env["GIT_COMMITTER_DATE"] = "2026-10-30T00:00:00Z"
-
-            def git(*args: str) -> str:
-                completed = subprocess.run(
-                    ["git", *args],
-                    cwd=repo,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    env=deterministic_env,
+    def test_producer_commit_rejects_tracked_and_untracked_status_output(self) -> None:
+        repo = Path("fixture-repo")
+        for status in (" M tracked.txt\n", "?? untracked.txt\n"):
+            with self.subTest(status=status.strip()):
+                dirty_status = subprocess.CompletedProcess(
+                    ["git", "status"], 0, stdout=status, stderr=""
                 )
-                return completed.stdout.strip()
+                with mock.patch.object(
+                    producer.subprocess, "run", return_value=dirty_status
+                ) as run_git:
+                    with self.assertRaisesRegex(producer.ProducerError, "worktree is dirty"):
+                        producer._producer_commit(repo)
+                command = run_git.call_args.args[0]
+                self.assertEqual(command[:2], ["git", "status"])
+                self.assertIn("--untracked-files=all", command)
+                self.assertEqual(run_git.call_args.kwargs["cwd"], repo)
 
-            git("init", "--quiet")
-            git("config", "user.name", "WorldForge test fixture")
-            git("config", "user.email", "fixture@example.invalid")
-            tracked = repo / "tracked.txt"
-            tracked.write_text("committed\n", encoding="utf-8")
-            git("add", "tracked.txt")
-            git("commit", "--quiet", "-m", "fixture commit")
-            expected_commit = git("rev-parse", "HEAD")
-            self.assertEqual(producer._producer_commit(repo), expected_commit)
-
-            tracked.write_text("modified\n", encoding="utf-8")
-            with self.assertRaisesRegex(producer.ProducerError, "worktree is dirty"):
-                producer._producer_commit(repo)
-
-            tracked.write_text("committed\n", encoding="utf-8")
-            (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
-            with self.assertRaisesRegex(producer.ProducerError, "worktree is dirty"):
-                producer._producer_commit(repo)
+        clean_status = subprocess.CompletedProcess(
+            ["git", "status"], 0, stdout="", stderr=""
+        )
+        head_revision = subprocess.CompletedProcess(
+            ["git", "rev-parse", "HEAD"], 0, stdout=f"{FIXTURE_COMMIT}\n", stderr=""
+        )
+        with mock.patch.object(
+            producer.subprocess, "run", side_effect=(clean_status, head_revision)
+        ) as run_git:
+            self.assertEqual(producer._producer_commit(repo), FIXTURE_COMMIT)
+        self.assertEqual(
+            run_git.call_args_list[1].args[0], ["git", "rev-parse", "HEAD"]
+        )
 
     def test_cli_builds_fixture_and_samples_match_declared_grs80_aeqd(self) -> None:
         spec, source, samples, _h0 = _small_fixture("fixture-one", -76.5, 39.2, 3.0)
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir = root / "inputs"
             source_dir.mkdir()
@@ -528,6 +590,218 @@ class TerrainGridV1Tests(unittest.TestCase):
                     (repeated_dir / filename).read_bytes(),
                 )
 
+    def test_golden_adjacent_windows_share_only_the_declared_boundary_column(self) -> None:
+        parent = producer.REGIONS["golden"]
+        west, east = producer.golden_adjacent_tile_specs()
+        producer.validate_adjacent_tile_specs(parent, west, east)
+        self.assertEqual(west.source_window, (2544, 8214, 216, 217))
+        self.assertEqual(east.source_window, (2544, 8430, 216, 216))
+        self.assertEqual(west.frame_id, parent.frame_id)
+        self.assertEqual(east.frame_id, parent.frame_id)
+        self.assertEqual(west.region_id, parent.region_id)
+
+        west_row, west_column, rows, west_columns = west.source_window
+        east_row, east_column, east_rows, east_columns = east.source_window
+        gap = replace(
+            east,
+            source_window=(east_row, east_column + 1, east_rows, east_columns - 1),
+        )
+        overlap = replace(
+            east,
+            source_window=(
+                east_row,
+                west_column + west_columns - 2,
+                east_rows,
+                east_columns + 1,
+            ),
+        )
+        outside_parent = replace(
+            west,
+            source_window=(west_row, west_column - 1, rows, west_columns),
+        )
+        mismatched_rows = replace(
+            east,
+            source_window=(east_row + 1, east_column, east_rows - 1, east_columns),
+        )
+        mismatched_frame = replace(east, frame_id="wf-vs01:other-frame")
+
+        with self.assertRaisesRegex(producer.ProducerError, "exactly one boundary column"):
+            producer.validate_adjacent_tile_specs(parent, west, gap)
+        with self.assertRaisesRegex(producer.ProducerError, "exactly one boundary column"):
+            producer.validate_adjacent_tile_specs(parent, west, overlap)
+        with self.assertRaisesRegex(producer.ProducerError, "outside the parent source window"):
+            producer.validate_adjacent_tile_specs(parent, outside_parent, east)
+        with self.assertRaisesRegex(producer.ProducerError, "same complete parent row range"):
+            producer.validate_adjacent_tile_specs(parent, west, mismatched_rows)
+        with self.assertRaisesRegex(producer.ProducerError, "region and frame identity"):
+            producer.validate_adjacent_tile_specs(parent, west, mismatched_frame)
+
+    def test_golden_tiles_cli_checks_frame_seam_hashes_and_reproducibility(self) -> None:
+        parent, source, samples, h0 = _small_adjacent_fixture()
+        west_spec, east_spec = producer.golden_adjacent_tile_specs(parent)
+
+        def verified_tile(_source_dir, _ledger, spec):
+            row, column, rows, columns = spec.source_window
+            return source, samples[row : row + rows, column : column + columns], h0
+
+        with _temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(root / "output"),
+                "--region", "golden-tiles",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(producer, "_verify_raster_window", side_effect=verified_tile),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(producer.main(args), 0, stderr.getvalue())
+                results = json.loads(stdout.getvalue())
+                self.assertEqual(len(results), 2)
+                output_root = root / "output"
+                west_bundle = output_root / "golden-west"
+                east_bundle = output_root / "golden-east"
+                west, east = producer.validate_adjacent_tile_bundles(
+                    parent,
+                    west_spec,
+                    east_spec,
+                    west_bundle,
+                    east_bundle,
+                    SCHEMA_PATH,
+                )
+                self.validator.validate(west)
+                self.validator.validate(east)
+                self.assertEqual(west["frame"], east["frame"])
+                self.assertEqual(
+                    west["frame_definition_sha256"], east["frame_definition_sha256"]
+                )
+                self.assertEqual(west["grid"]["region_id"], parent.region_id)
+                self.assertEqual(
+                    west["grid"]["source_window"],
+                    {"row_offset": 0, "column_offset": 0, "rows": 2, "columns": 3},
+                )
+                self.assertEqual(
+                    east["grid"]["source_window"],
+                    {"row_offset": 0, "column_offset": 2, "rows": 2, "columns": 2},
+                )
+                for result, manifest, bundle in (
+                    (results[0], west, west_bundle),
+                    (results[1], east, east_bundle),
+                ):
+                    self.assertEqual(result["artifact_id"], manifest["artifact_id"])
+                    self.assertEqual(
+                        result["frame_definition_sha256"],
+                        manifest["frame_definition_sha256"],
+                    )
+                    for payload_key, filename in (
+                        ("horizontal_xy", "horizontal_xy.f64le"),
+                        ("height_samples", "height_samples.f32le"),
+                    ):
+                        payload = (bundle / filename).read_bytes()
+                        self.assertEqual(
+                            hashlib.sha256(payload).hexdigest(),
+                            manifest["payloads"][payload_key]["sha256"],
+                        )
+
+                west_height_bytes = (west_bundle / "height_samples.f32le").read_bytes()
+                east_height_bytes = (east_bundle / "height_samples.f32le").read_bytes()
+                self.assertEqual(
+                    west_height_bytes,
+                    np.ascontiguousarray(samples[:, :3], dtype="<f4").tobytes(),
+                )
+                self.assertEqual(
+                    east_height_bytes,
+                    np.ascontiguousarray(samples[:, 2:], dtype="<f4").tobytes(),
+                )
+                self.assertEqual(
+                    (west_bundle / "horizontal_xy.f64le").read_bytes()[
+                        2 * 16 : 3 * 16
+                    ],
+                    (east_bundle / "horizontal_xy.f64le").read_bytes()[:16],
+                )
+                self.assertEqual(west_height_bytes[2 * 4 : 3 * 4], east_height_bytes[:4])
+
+                repeated_args = list(args)
+                repeated_args[repeated_args.index(str(root / "output"))] = str(
+                    root / "output-repeat"
+                )
+                repeated_stdout = io.StringIO()
+                with contextlib.redirect_stdout(repeated_stdout):
+                    self.assertEqual(producer.main(repeated_args), 0)
+                repeated_results = json.loads(repeated_stdout.getvalue())
+                for key in ("golden-west", "golden-east"):
+                    original = output_root / key
+                    repeated = root / "output-repeat" / key
+                    for filename in (
+                        "manifest.json",
+                        "horizontal_xy.f64le",
+                        "height_samples.f32le",
+                    ):
+                        self.assertEqual(
+                            (original / filename).read_bytes(),
+                            (repeated / filename).read_bytes(),
+                        )
+                self.assertEqual(
+                    [entry["artifact_id"] for entry in results],
+                    [entry["artifact_id"] for entry in repeated_results],
+                )
+
+    def test_golden_tiles_failure_rolls_back_only_new_output(self) -> None:
+        parent, source, samples, h0 = _small_adjacent_fixture()
+
+        def fail_east(_source_dir, _ledger, spec):
+            if spec.key == "golden-east":
+                raise producer.ProducerError("injected east-tile failure")
+            row, column, rows, columns = spec.source_window
+            return source, samples[row : row + rows, column : column + columns], h0
+
+        with _temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "partial-output"
+            output_root.mkdir()
+            user_file = output_root / "user-owned-note.txt"
+            user_file.write_text("keep this file\n", encoding="utf-8")
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(output_root),
+                "--region", "golden-tiles",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(producer, "_verify_raster_window", side_effect=fail_east),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(producer.main(args), 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("injected east-tile failure", stderr.getvalue())
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()), [user_file.name]
+            )
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "keep this file\n")
+
     def test_both_regions_roll_back_new_outputs_and_preserve_existing_user_files(self) -> None:
         first = _small_fixture("fixture-first", -76.5, 39.2, 3.0)
         second = _small_fixture("fixture-second", -105.2, 39.7, 100.0)
@@ -539,7 +813,7 @@ class TerrainGridV1Tests(unittest.TestCase):
                 raise producer.ProducerError("injected later-region failure")
             return sources[spec.key]
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir = root / "inputs"
             source_dir.mkdir()
@@ -575,7 +849,7 @@ class TerrainGridV1Tests(unittest.TestCase):
 
     def test_partial_payload_write_is_removed_without_touching_other_output(self) -> None:
         spec, source, samples, _h0 = _small_fixture("fixture-partial", -76.5, 39.2, 3.0)
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir = root / "inputs"
             source_dir.mkdir()
@@ -654,7 +928,7 @@ class TerrainGridV1Tests(unittest.TestCase):
                 ])
 
         spec, source, samples, _h0 = _small_fixture("fixture-existing", -76.5, 39.2, 3.0)
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir = root / "inputs"
             source_dir.mkdir()
@@ -831,6 +1105,102 @@ class TerrainGridV1Tests(unittest.TestCase):
                     f"inverse/direct round-trip max={max(roundtrip_errors):.12g} m"
                 )
         self.assertEqual(len(set(projection_versions)), 1)
+
+        west_bundle = REAL_BUNDLE_ROOT / "golden-west"
+        east_bundle = REAL_BUNDLE_ROOT / "golden-east"
+        if west_bundle.exists() or east_bundle.exists():
+            self.assertTrue(west_bundle.is_dir() and east_bundle.is_dir())
+            parent = producer.REGIONS["golden"]
+            west_spec, east_spec = producer.golden_adjacent_tile_specs(parent)
+            west, east = producer.validate_adjacent_tile_bundles(
+                parent,
+                west_spec,
+                east_spec,
+                west_bundle,
+                east_bundle,
+                SCHEMA_PATH,
+            )
+            self.assertEqual(west["frame"], east["frame"])
+            self.assertEqual(
+                west["frame_definition_sha256"], east["frame_definition_sha256"]
+            )
+            self.assertEqual(west["source"], east["source"])
+
+            row_offset, column_offset, rows, columns = parent.source_window
+            west_heights = np.fromfile(
+                west_bundle / "height_samples.f32le", dtype="<f4"
+            ).reshape(rows, west_spec.source_window[3])
+            east_heights = np.fromfile(
+                east_bundle / "height_samples.f32le", dtype="<f4"
+            ).reshape(rows, east_spec.source_window[3])
+            west_xy = np.fromfile(
+                west_bundle / "horizontal_xy.f64le", dtype="<f8"
+            ).reshape(rows, west_spec.source_window[3], 2)
+            east_xy = np.fromfile(
+                east_bundle / "horizontal_xy.f64le", dtype="<f8"
+            ).reshape(rows, east_spec.source_window[3], 2)
+            combined_heights = np.concatenate((west_heights, east_heights[:, 1:]), axis=1)
+            combined_xy = np.concatenate((west_xy, east_xy[:, 1:, :]), axis=1)
+            self.assertEqual(combined_heights.shape, (rows, columns))
+            with rasterio.open(SOURCE_DIR / parent.raster_name) as dataset:
+                source_samples = dataset.read(
+                    1,
+                    window=Window(column_offset, row_offset, columns, rows),
+                    masked=False,
+                )
+                self.assertEqual(
+                    np.ascontiguousarray(combined_heights, dtype="<f4").tobytes(),
+                    np.ascontiguousarray(source_samples, dtype="<f4").tobytes(),
+                )
+
+                selected_rows = np.linspace(0, rows - 1, 13, dtype=np.int64)
+                selected_columns = np.linspace(0, columns - 1, 13, dtype=np.int64)
+                points: list[tuple[float, float, float, float]] = []
+                radial_vector_errors: list[float] = []
+                for row in selected_rows:
+                    for column in selected_columns:
+                        lon = dataset.transform.c + (
+                            column_offset + int(column) + 0.5
+                        ) * dataset.transform.a
+                        lat = dataset.transform.f + (
+                            row_offset + int(row) + 0.5
+                        ) * dataset.transform.e
+                        east_value, north_value = combined_xy[int(row), int(column)]
+                        distance, azimuth = _vincenty_inverse(
+                            parent.anchor_lon, parent.anchor_lat, lon, lat
+                        )
+                        radial_vector_errors.append(
+                            math.hypot(
+                                float(east_value) - distance * math.sin(azimuth),
+                                float(north_value) - distance * math.cos(azimuth),
+                            )
+                        )
+                        points.append(
+                            (lon, lat, float(east_value), float(north_value))
+                        )
+
+            pair_errors: list[float] = []
+            for first_index, first in enumerate(points):
+                for second in points[first_index + 1 :]:
+                    chart_distance = math.hypot(
+                        second[2] - first[2], second[3] - first[3]
+                    )
+                    geodesic_distance = _vincenty_inverse(
+                        first[0], first[1], second[0], second[1]
+                    )[0]
+                    pair_errors.append(abs(chart_distance - geodesic_distance))
+
+            # Main Lead's crop-specific limit is the 70.3 µm curvature bound
+            # plus a 1 mm independent numerical allowance; it is not a source
+            # accuracy statement or a global geographic tolerance.
+            self.assertLessEqual(max(radial_vector_errors), 0.0011)
+            self.assertLessEqual(max(pair_errors), 0.0011)
+            print(
+                "Golden adjacent tiles independent 13x13 GRS80 checks: "
+                f"max radial-vector error={max(radial_vector_errors):.12g} m, "
+                f"max pairwise chart/geodesic error={max(pair_errors):.12g} m; "
+                "0.0011 m crop criterion (not source accuracy)."
+            )
 
 
 if __name__ == "__main__":
