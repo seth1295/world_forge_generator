@@ -733,6 +733,48 @@ class TerrainGridV1Tests(unittest.TestCase):
                 )
                 self.assertEqual(west_height_bytes[2 * 4 : 3 * 4], east_height_bytes[:4])
 
+                west_height_path = west_bundle / "height_samples.f32le"
+                real_validate_bundle = producer.validate_bundle
+                for mutation, expected_error in (
+                    ("same-size", "payload SHA-256 mismatch during seam validation"),
+                    ("oversize", "payload byte length changed during seam validation"),
+                ):
+                    with self.subTest(seam_payload_mutation=mutation):
+                        mutation_done = False
+
+                        def validate_then_mutate(bundle_dir, schema_path):
+                            nonlocal mutation_done
+                            manifest = real_validate_bundle(bundle_dir, schema_path)
+                            if bundle_dir == west_bundle and not mutation_done:
+                                mutation_done = True
+                                if mutation == "same-size":
+                                    changed = bytearray(west_height_bytes)
+                                    changed[0] ^= 0x01
+                                    west_height_path.write_bytes(changed)
+                                else:
+                                    west_height_path.write_bytes(west_height_bytes + b"\x00")
+                            return manifest
+
+                        try:
+                            with mock.patch.object(
+                                producer,
+                                "validate_bundle",
+                                side_effect=validate_then_mutate,
+                            ):
+                                with self.assertRaisesRegex(
+                                    producer.ProducerError, expected_error
+                                ):
+                                    producer.validate_adjacent_tile_bundles(
+                                        parent,
+                                        west_spec,
+                                        east_spec,
+                                        west_bundle,
+                                        east_bundle,
+                                        SCHEMA_PATH,
+                                    )
+                        finally:
+                            west_height_path.write_bytes(west_height_bytes)
+
                 repeated_args = list(args)
                 repeated_args[repeated_args.index(str(root / "output"))] = str(
                     root / "output-repeat"
@@ -797,6 +839,74 @@ class TerrainGridV1Tests(unittest.TestCase):
                 self.assertEqual(producer.main(args), 1)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("injected east-tile failure", stderr.getvalue())
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()), [user_file.name]
+            )
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "keep this file\n")
+
+    def test_golden_tiles_seam_failure_rolls_back_both_new_outputs(self) -> None:
+        parent, source, samples, h0 = _small_adjacent_fixture()
+
+        def verify_tile(_source_dir, _ledger, spec):
+            row, column, rows, columns = spec.source_window
+            return source, samples[row : row + rows, column : column + columns], h0
+
+        def fail_after_both_bundles(
+            _parent,
+            _west_spec,
+            _east_spec,
+            west_bundle,
+            east_bundle,
+            _schema_path,
+        ):
+            expected_files = {
+                "manifest.json",
+                "horizontal_xy.f64le",
+                "height_samples.f32le",
+            }
+            self.assertEqual(
+                {path.name for path in west_bundle.iterdir()}, expected_files
+            )
+            self.assertEqual(
+                {path.name for path in east_bundle.iterdir()}, expected_files
+            )
+            raise producer.ProducerError("injected seam-validation failure")
+
+        with _temporary_directory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "inputs"
+            source_dir.mkdir()
+            ledger = root / "ledger.md"
+            ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+            output_root = root / "partial-output"
+            output_root.mkdir()
+            user_file = output_root / "user-owned-note.txt"
+            user_file.write_text("keep this file\n", encoding="utf-8")
+            args = [
+                "--source-dir", str(source_dir),
+                "--ledger", str(ledger),
+                "--schema", str(SCHEMA_PATH),
+                "--output-root", str(output_root),
+                "--region", "golden-tiles",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
+                mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
+                mock.patch.object(producer, "_verify_raster_window", side_effect=verify_tile),
+                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer,
+                    "validate_adjacent_tile_bundles",
+                    side_effect=fail_after_both_bundles,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(producer.main(args), 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("injected seam-validation failure", stderr.getvalue())
             self.assertEqual(
                 sorted(path.name for path in output_root.iterdir()), [user_file.name]
             )
