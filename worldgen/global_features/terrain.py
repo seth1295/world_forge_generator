@@ -17,7 +17,9 @@ TERRAIN_SAMPLER_INTERFACE_ID = "worldforge_terrain_sampler_v1"
 
 class TerrainSampleOutcome(StrEnum):
     READY = "ready"
+    PARTIAL = "partial"
     UNAVAILABLE = "unavailable"
+    FAILED = "failed"
     CANCELLED = "cancelled"
 
 
@@ -66,6 +68,14 @@ class TerrainSampler(Protocol):
 
 @dataclass(frozen=True)
 class DrapeResult:
+    """All-or-nothing feature result with explicit sample-gap accounting.
+
+    ``requested_sample_count`` is the number of input line coordinates,
+    ``returned_height_count`` is the raw count supplied by the sampler, and
+    ``gap_count`` counts missing or invalid source samples. Partial/failed
+    results never include draped geometry.
+    """
+
     outcome: TerrainSampleOutcome
     geometry: dict[str, Any] | None
     vertical_reference: HeightReference | None
@@ -73,6 +83,9 @@ class DrapeResult:
     source_lineage: tuple[dict[str, object], ...]
     sample_trace: tuple[TerrainSampleTrace, ...] = ()
     error_code: str | None = None
+    requested_sample_count: int = 0
+    returned_height_count: int = 0
+    gap_count: int = 0
 
 
 def drape_road_centerline(
@@ -118,79 +131,183 @@ def drape_road_centerline(
                 "road coordinates must be WGS84 longitude/latitude degrees"
             )
     samples = sampler.sample_heights(coordinates, cancellation)
+    requested_count = len(coordinates)
+    returned_count = len(samples.heights_m)
     if samples.outcome is TerrainSampleOutcome.CANCELLED or cancellation.cancelled:
         return DrapeResult(
-            TerrainSampleOutcome.CANCELLED,
-            None,
-            samples.vertical_reference,
-            samples.sample_method,
-            samples.source_lineage,
-            samples.sample_trace,
-            samples.error_code or cancellation.reason,
+            outcome=TerrainSampleOutcome.CANCELLED,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code=samples.error_code or cancellation.reason,
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=max(0, requested_count - min(returned_count, requested_count)),
         )
     if samples.outcome is TerrainSampleOutcome.UNAVAILABLE:
         return DrapeResult(
-            TerrainSampleOutcome.UNAVAILABLE,
-            None,
-            samples.vertical_reference,
-            samples.sample_method,
-            samples.source_lineage,
-            samples.sample_trace,
-            samples.error_code,
+            outcome=TerrainSampleOutcome.UNAVAILABLE,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code=samples.error_code or "terrain_sample_unavailable",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=max(0, requested_count - min(returned_count, requested_count)),
+        )
+    if samples.outcome in {
+        TerrainSampleOutcome.PARTIAL,
+        TerrainSampleOutcome.FAILED,
+    }:
+        available_count = min(
+            returned_count, len(samples.sample_trace), requested_count
+        )
+        return DrapeResult(
+            outcome=samples.outcome,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code=samples.error_code or "terrain_sampler_incomplete",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=max(0, requested_count - available_count),
         )
     if samples.outcome is not TerrainSampleOutcome.READY:
         raise ValueError("unknown terrain sample outcome")
     if samples.vertical_reference is not HeightReference.WGS84_ELLIPSOIDAL:
-        raise ValueError(
-            "ready road drapes require WGS84 ellipsoidal height (EPSG:4979); orthometric heights are not accepted"
+        return DrapeResult(
+            outcome=TerrainSampleOutcome.FAILED,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code="vertical_reference_invalid",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=requested_count,
         )
     if not samples.sample_method or not samples.source_lineage:
-        raise ValueError(
-            "ready terrain samples must carry a sampler method and source lineage"
+        return DrapeResult(
+            outcome=TerrainSampleOutcome.FAILED,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code="terrain_lineage_missing",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=requested_count,
         )
-    if len(samples.heights_m) != len(coordinates):
-        raise ValueError("terrain sampler must return one height per road coordinate")
-    if len(samples.sample_trace) != len(coordinates):
-        raise ValueError(
-            "terrain sampler must return one provenance trace per road coordinate"
+    available_count = min(returned_count, len(samples.sample_trace), requested_count)
+    if (
+        returned_count != requested_count
+        or len(samples.sample_trace) != requested_count
+    ):
+        missing_count = requested_count - available_count
+        outcome = (
+            TerrainSampleOutcome.PARTIAL
+            if missing_count > 0
+            else TerrainSampleOutcome.FAILED
         )
-    if any(not math.isfinite(float(height)) for height in samples.heights_m):
-        raise ValueError("terrain sampler returned a non-finite height")
+        return DrapeResult(
+            outcome=outcome,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code="terrain_sample_count_mismatch",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=max(0, missing_count),
+        )
+    invalid_sample_gaps = 0
     for height, trace in zip(samples.heights_m, samples.sample_trace, strict=True):
-        if not trace.source_vertical_reference or not trace.sampler_method:
-            raise ValueError(
-                "terrain sample trace must name its source vertical reference and method"
-            )
-        if not trace.terrain_artifact_id:
-            raise ValueError("terrain sample trace must identify its source artifact")
-        if not math.isfinite(float(trace.ellipsoidal_height_m)) or float(
-            trace.ellipsoidal_height_m
-        ) != float(height):
-            raise ValueError(
-                "terrain trace ellipsoidal height must match the returned sample"
-            )
-        if len(trace.terrain_artifact_sha256) != 64 or any(
-            char not in "0123456789abcdef" for char in trace.terrain_artifact_sha256
+        try:
+            finite_height = math.isfinite(float(height))
+        except (TypeError, ValueError, OverflowError):
+            finite_height = False
+        if not finite_height:
+            invalid_sample_gaps += 1
+            continue
+        if (
+            not isinstance(trace.source_vertical_reference, str)
+            or not trace.source_vertical_reference
+            or not isinstance(trace.sampler_method, str)
+            or not trace.sampler_method
         ):
-            raise ValueError(
-                "terrain sample trace must carry a lowercase SHA-256 artifact hash"
-            )
-        if trace.source_height_m is None or not math.isfinite(
-            float(trace.source_height_m)
+            invalid_sample_gaps += 1
+            continue
+        if (
+            not isinstance(trace.terrain_artifact_id, str)
+            or not trace.terrain_artifact_id
         ):
-            raise ValueError("terrain sample trace must preserve its source height")
+            invalid_sample_gaps += 1
+            continue
+        try:
+            trace_height_valid = math.isfinite(float(trace.ellipsoidal_height_m)) and (
+                float(trace.ellipsoidal_height_m) == float(height)
+            )
+        except (TypeError, ValueError, OverflowError):
+            trace_height_valid = False
+        if not trace_height_valid:
+            invalid_sample_gaps += 1
+            continue
+        if (
+            not isinstance(trace.terrain_artifact_sha256, str)
+            or len(trace.terrain_artifact_sha256) != 64
+            or any(
+                char not in "0123456789abcdef" for char in trace.terrain_artifact_sha256
+            )
+        ):
+            invalid_sample_gaps += 1
+            continue
+        try:
+            source_height_valid = trace.source_height_m is not None and math.isfinite(
+                float(trace.source_height_m)
+            )
+        except (TypeError, ValueError, OverflowError):
+            source_height_valid = False
+        if not source_height_valid:
+            invalid_sample_gaps += 1
+            continue
         source_reference = trace.source_vertical_reference.casefold()
         if "egm2008" in source_reference or "orthometric" in source_reference:
-            if trace.geoid_undulation_m is None or not math.isfinite(
-                float(trace.geoid_undulation_m)
+            try:
+                geoid_valid = trace.geoid_undulation_m is not None and math.isfinite(
+                    float(trace.geoid_undulation_m)
+                )
+            except (TypeError, ValueError, OverflowError):
+                geoid_valid = False
+            if not geoid_valid:
+                invalid_sample_gaps += 1
+                continue
+            if (
+                not isinstance(trace.conversion_method, str)
+                or not trace.conversion_method
             ):
-                raise ValueError(
-                    "orthometric terrain samples require the geoid undulation used in conversion"
-                )
-            if not trace.conversion_method:
-                raise ValueError(
-                    "orthometric terrain samples require the height-conversion method"
-                )
+                invalid_sample_gaps += 1
+    if invalid_sample_gaps:
+        return DrapeResult(
+            outcome=TerrainSampleOutcome.FAILED,
+            geometry=None,
+            vertical_reference=samples.vertical_reference,
+            sample_method=samples.sample_method,
+            source_lineage=samples.source_lineage,
+            sample_trace=samples.sample_trace,
+            error_code="terrain_sample_provenance_or_conversion_invalid",
+            requested_sample_count=requested_count,
+            returned_height_count=returned_count,
+            gap_count=invalid_sample_gaps,
+        )
     iterator = iter(float(height) for height in samples.heights_m)
     draped_parts = [
         [[float(point[0]), float(point[1]), next(iterator)] for point in part]
@@ -207,6 +324,9 @@ def drape_road_centerline(
         samples.sample_method,
         samples.source_lineage,
         samples.sample_trace,
+        requested_sample_count=requested_count,
+        returned_height_count=returned_count,
+        gap_count=0,
     )
 
 

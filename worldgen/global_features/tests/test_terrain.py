@@ -72,6 +72,9 @@ class TerrainDrapeTests(unittest.TestCase):
             [[151.1, -33.9, 14.5], [151.2, -33.8, 15.25]],
         )
         self.assertEqual(result.vertical_reference, HeightReference.WGS84_ELLIPSOIDAL)
+        self.assertEqual(result.requested_sample_count, 2)
+        self.assertEqual(result.returned_height_count, 2)
+        self.assertEqual(result.gap_count, 0)
         self.assertEqual(result.source_lineage[0]["provider"], "test terrain fixture")
         self.assertEqual(result.sample_trace[0].source_height_m, 10.0)
         self.assertEqual(result.sample_trace[0].geoid_undulation_m, 4.5)
@@ -94,6 +97,8 @@ class TerrainDrapeTests(unittest.TestCase):
         )
         self.assertEqual(unavailable.outcome, TerrainSampleOutcome.UNAVAILABLE)
         self.assertIsNone(unavailable.geometry)
+        self.assertEqual(unavailable.requested_sample_count, 2)
+        self.assertEqual(unavailable.gap_count, 2)
         token = CancellationToken()
         token.cancel()
         cancelled = drape_road_centerline(
@@ -103,68 +108,90 @@ class TerrainDrapeTests(unittest.TestCase):
         )
         self.assertEqual(cancelled.outcome, TerrainSampleOutcome.CANCELLED)
         self.assertIsNone(cancelled.geometry)
+        self.assertEqual(cancelled.requested_sample_count, 0)
 
     def test_sampler_cannot_return_partial_or_nonfinite_heights(self) -> None:
         geometry = {"type": "LineString", "coordinates": [[0.0, 0.0], [0.1, 0.1]]}
-        with self.assertRaisesRegex(ValueError, "one height"):
-            drape_road_centerline(
-                geometry,
-                FakeSampler(
-                    TerrainSamples(
-                        TerrainSampleOutcome.READY,
-                        (12.0,),
-                        HeightReference.WGS84_ELLIPSOIDAL,
-                        sample_method="test sampler",
-                        source_lineage=({"artifact_id": "test-terrain"},),
-                    )
-                ),
-                CancellationToken(),
-            )
-        with self.assertRaisesRegex(ValueError, "non-finite"):
-            drape_road_centerline(
-                geometry,
-                FakeSampler(
-                    TerrainSamples(
-                        TerrainSampleOutcome.READY,
-                        (12.0, float("nan")),
-                        HeightReference.WGS84_ELLIPSOIDAL,
-                        sample_method="test sampler",
-                        source_lineage=({"artifact_id": "test-terrain"},),
-                        sample_trace=(
-                            TerrainSampleTrace(
-                                12.0,
-                                "EPSG:4979 ellipsoidal metres",
-                                None,
-                                12.0,
-                                "terrain",
-                                "a" * 64,
-                                "sample",
-                            ),
-                            TerrainSampleTrace(
-                                float("nan"),
-                                "EPSG:4979 ellipsoidal metres",
-                                None,
-                                float("nan"),
-                                "terrain",
-                                "a" * 64,
-                                "sample",
-                            ),
+        partial = drape_road_centerline(
+            geometry,
+            FakeSampler(
+                TerrainSamples(
+                    TerrainSampleOutcome.READY,
+                    (12.0,),
+                    HeightReference.WGS84_ELLIPSOIDAL,
+                    sample_method="test sampler",
+                    source_lineage=({"artifact_id": "test-terrain"},),
+                    sample_trace=(
+                        TerrainSampleTrace(
+                            12.0,
+                            "EPSG:4979 ellipsoidal metres",
+                            None,
+                            12.0,
+                            "terrain",
+                            "a" * 64,
+                            "sample",
                         ),
-                    )
-                ),
-                CancellationToken(),
-            )
+                    ),
+                )
+            ),
+            CancellationToken(),
+        )
+        self.assertEqual(partial.outcome, TerrainSampleOutcome.PARTIAL)
+        self.assertEqual(partial.requested_sample_count, 2)
+        self.assertEqual(partial.returned_height_count, 1)
+        self.assertEqual(partial.gap_count, 1)
+        self.assertEqual(partial.error_code, "terrain_sample_count_mismatch")
+        self.assertIsNone(partial.geometry)
+        nonfinite = drape_road_centerline(
+            geometry,
+            FakeSampler(
+                TerrainSamples(
+                    TerrainSampleOutcome.READY,
+                    (12.0, float("nan")),
+                    HeightReference.WGS84_ELLIPSOIDAL,
+                    sample_method="test sampler",
+                    source_lineage=({"artifact_id": "test-terrain"},),
+                    sample_trace=(
+                        TerrainSampleTrace(
+                            12.0,
+                            "EPSG:4979 ellipsoidal metres",
+                            None,
+                            12.0,
+                            "terrain",
+                            "a" * 64,
+                            "sample",
+                        ),
+                        TerrainSampleTrace(
+                            float("nan"),
+                            "EPSG:4979 ellipsoidal metres",
+                            None,
+                            float("nan"),
+                            "terrain",
+                            "a" * 64,
+                            "sample",
+                        ),
+                    ),
+                )
+            ),
+            CancellationToken(),
+        )
+        self.assertEqual(nonfinite.outcome, TerrainSampleOutcome.FAILED)
+        self.assertEqual(nonfinite.gap_count, 1)
+        self.assertIsNone(nonfinite.geometry)
 
     def test_ready_sampler_rejects_orthometric_height_without_conversion(self) -> None:
         geometry = {"type": "LineString", "coordinates": [[0.0, 0.0], [0.1, 0.1]]}
-        with self.assertRaisesRegex(ValueError, "ellipsoidal"):
-            drape_road_centerline(
-                geometry,
-                FakeSampler(
-                    TerrainSamples(TerrainSampleOutcome.READY, (12.0, 13.0), None)
-                ),
-                CancellationToken(),
-            )
+        rejected = drape_road_centerline(
+            geometry,
+            FakeSampler(TerrainSamples(TerrainSampleOutcome.READY, (12.0, 13.0), None)),
+            CancellationToken(),
+        )
+        self.assertEqual(rejected.outcome, TerrainSampleOutcome.FAILED)
+        self.assertEqual(rejected.error_code, "vertical_reference_invalid")
+        self.assertEqual(rejected.requested_sample_count, 2)
+        self.assertEqual(rejected.returned_height_count, 2)
+        self.assertEqual(rejected.gap_count, 2)
+        self.assertIsNone(rejected.geometry)
 
 
 if __name__ == "__main__":
