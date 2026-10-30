@@ -1,0 +1,8 @@
+# Standalone global geographic feature producer (Python 3.12).
+# SPDX metadata as published by each package; exact versions used by the Windows acceptance run.
+certifi==2026.7.22       # MPL-2.0; verified HTTPS trust bundle for this Windows environment
+numpy==2.5.4             # BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0; raster window arrays
+pyarrow==26.0.0           # Apache-2.0; Overture STAC GeoParquet metadata and bounded row-group reads
+rasterio==1.5.2           # BSD-3-Clause; local COG window reads
+shapely==2.2.0            # BSD-3-Clause; exact tile intersections and geometry validation
+tzdata==2026.6            # Apache-2.0; timezone database needed by PyArrow on Windows
