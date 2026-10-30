@@ -333,20 +333,22 @@ def _ledger_row(
             raise ProducerError(f"source ledger size is outside the v1 byte limit for {spec.key}")
         records.append((size, digest.lower()))
     urls = re.findall(r"\]\((https?://[^)]+)\)", line)
-    receipts = re.findall(r"local snapshot file-creation receipt `([^`]+)`", line)
-    if len(receipts) != 1 or not re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", receipts[0]
+    snapshot_timestamps = re.findall(
+        r"local snapshot file-creation receipt `([^`]+)`", line
+    )
+    if len(snapshot_timestamps) != 1 or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", snapshot_timestamps[0]
     ):
         raise ProducerError(
-            f"source ledger must contain one UTC acquisition receipt for {spec.key}"
+            f"source ledger must contain one UTC local snapshot timestamp for {spec.key}"
         )
     try:
-        datetime.fromisoformat(receipts[0][:-1] + "+00:00")
+        datetime.fromisoformat(snapshot_timestamps[0][:-1] + "+00:00")
     except ValueError as exc:
         raise ProducerError(
-            f"source ledger acquisition receipt is not a valid UTC time for {spec.key}"
+            f"source ledger local snapshot timestamp is not a valid UTC time for {spec.key}"
         ) from exc
-    return records, urls, receipts[0]
+    return records, urls, snapshot_timestamps[0]
 
 
 def _read_xml_text(path: Path) -> list[str]:
@@ -788,7 +790,7 @@ def _manifest_source(
         "product_date": spec.product_date,
         "source_uri": record["downloadURL"],
         "acquired_at_utc": source.acquired_at_utc,
-        "acquisition_time_basis": "recorded_download_receipt",
+        "acquisition_time_basis": "filesystem_creation_time",
         "snapshot_verified_date": SOURCE_VERIFIED_DATE,
         "raster": {
             "byte_length": source.raster_bytes,
@@ -1295,7 +1297,8 @@ def build_bundle(
     schema_path: Path,
     output_root: Path,
     producer_commit: str,
-) -> tuple[Path, dict[str, Any], dict[str, float]]:
+) -> tuple[Path, dict[str, Any], dict[str, float], str]:
+    """Build a bundle and return its serialized-manifest SHA for ownership tracking."""
     source, samples, h0 = _verify_raster_window(source_dir, ledger_path, spec)
     row_offset, column_offset, rows, columns = spec.source_window
     validate_relative_heights(samples, h0, spec.key)
@@ -1330,6 +1333,7 @@ def build_bundle(
         raise ProducerError(f"cannot serialize manifest: {exc}") from exc
     if len(serialized_manifest) > MANIFEST_LIMIT_BYTES:
         raise ProducerError("manifest exceeds the 64 KiB contract limit")
+    serialized_manifest_sha256 = hashlib.sha256(serialized_manifest).hexdigest()
 
     schema = load_json_unique(schema_path, max_bytes=1024 * 1024)
     try:
@@ -1384,27 +1388,27 @@ def build_bundle(
         "product_record_sha256": source.record_sha256,
         "horizontal_payload_sha256": validated["payloads"]["horizontal_xy"]["sha256"],
         "height_payload_sha256": validated["payloads"]["height_samples"]["sha256"],
+        "manifest_sha256": serialized_manifest_sha256,
         "source_height_min_m": source.raster_min,
         "source_height_max_m": source.raster_max,
         "acquired_at_utc": source.acquired_at_utc,
     }
-    return bundle_dir, result, projected_bounds
+    return bundle_dir, result, projected_bounds, serialized_manifest_sha256
 
 
 def _remove_generated_bundle(
     bundle_dir: Path,
     expected_result: dict[str, Any],
-    expected_manifest_sha256: str | None,
+    expected_manifest_sha256: str,
     schema_path: Path,
 ) -> None:
-    """Remove only a complete bundle proven to match this invocation's output."""
+    """Remove only a complete bundle whose manifest and payload hashes still match."""
     manifest = validate_bundle(bundle_dir, schema_path)
     manifest_sha256, _manifest_size = sha256_file(
         bundle_dir / "manifest.json", max_bytes=MANIFEST_LIMIT_BYTES
     )
     if (
-        expected_manifest_sha256 is None
-        or manifest_sha256 != expected_manifest_sha256
+        manifest_sha256 != expected_manifest_sha256
         or manifest["artifact_id"] != expected_result["artifact_id"]
         or manifest["payloads"]["horizontal_xy"]["sha256"]
         != expected_result["horizontal_payload_sha256"]
@@ -1456,10 +1460,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             selected = [REGIONS[args.region]]
         results = []
-        generated: list[tuple[Path, dict[str, Any], str | None]] = []
+        generated: list[tuple[Path, dict[str, Any], str]] = []
         try:
             for spec in selected:
-                bundle_dir, result, projected_bounds = build_bundle(
+                (
+                    bundle_dir,
+                    result,
+                    projected_bounds,
+                    expected_manifest_sha256,
+                ) = build_bundle(
                     spec,
                     args.source_dir,
                     args.ledger,
@@ -1467,11 +1476,15 @@ def main(argv: list[str] | None = None) -> int:
                     args.output_root,
                     producer_commit,
                 )
-                generated.append((bundle_dir, result, None))
+                # Record this invocation's ownership proof before the fallible file read.
+                generated.append((bundle_dir, result, expected_manifest_sha256))
                 manifest_sha256, _manifest_size = sha256_file(
                     bundle_dir / "manifest.json", max_bytes=MANIFEST_LIMIT_BYTES
                 )
-                generated[-1] = (bundle_dir, result, manifest_sha256)
+                if manifest_sha256 != expected_manifest_sha256:
+                    raise ProducerError(
+                        f"manifest changed after bundle creation for {spec.key}"
+                    )
                 result["projected_sample_bounds_m"] = projected_bounds
                 results.append(result)
             if args.region == "golden-tiles":

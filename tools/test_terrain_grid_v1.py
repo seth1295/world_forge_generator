@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -198,7 +199,7 @@ def _test_paths() -> tuple[Path, Path, Path | None, Path | None]:
 
 
 SCHEMA_PATH, EXAMPLE_DIR, REAL_BUNDLE_ROOT, SOURCE_DIR = _test_paths()
-FIXTURE_RECEIPT = "2026-10-29T00:00:00Z"
+FIXTURE_SNAPSHOT_CREATED_UTC = "2026-10-29T00:00:00Z"
 FIXTURE_COMMIT = "a" * 40
 
 
@@ -272,7 +273,7 @@ def _small_fixture(
         xml_bytes=256,
         record_bytes=192,
         record=record,
-        acquired_at_utc=FIXTURE_RECEIPT,
+        acquired_at_utc=FIXTURE_SNAPSHOT_CREATED_UTC,
         affine=(0.01, 0.0, anchor_lon - 0.005, 0.0, -0.01, anchor_lat + 0.005),
         source_width=2,
         source_height=2,
@@ -321,7 +322,7 @@ def _small_source_ledger(root: Path, spec: producer.RegionSpec) -> tuple[Path, P
     ledger.write_text(
         f"| {spec.product_id} | "
         + " | ".join(columns)
-        + f" | local snapshot file-creation receipt `{FIXTURE_RECEIPT}` |\n",
+        + f" | local snapshot file-creation receipt `{FIXTURE_SNAPSHOT_CREATED_UTC}` |\n",
         encoding="utf-8",
     )
     return source_dir, ledger
@@ -591,15 +592,17 @@ class TerrainGridV1Tests(unittest.TestCase):
                 np.asarray([24_001.0], dtype=np.float32), 0.0, "fixture"
             )
 
-    def test_source_sizes_are_bounded_before_hashing_and_receipt_comes_from_ledger(self) -> None:
+    def test_source_sizes_are_bounded_before_hashing_and_snapshot_time_comes_from_ledger(
+        self,
+    ) -> None:
         spec = producer.REGIONS["baltimore"]
         with _temporary_directory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir, ledger_path = _small_source_ledger(root, spec)
-            _record, expected, acquired_at_utc = producer._verify_record_and_ledger(
+            _record, expected, snapshot_created_at_utc = producer._verify_record_and_ledger(
                 source_dir, ledger_path, spec
             )
-            self.assertEqual(acquired_at_utc, FIXTURE_RECEIPT)
+            self.assertEqual(snapshot_created_at_utc, FIXTURE_SNAPSHOT_CREATED_UTC)
             self.assertEqual(
                 [size for size, _digest in expected],
                 [
@@ -689,7 +692,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                     "_verify_raster_window",
                     return_value=(source, samples, spec.ledger_h0),
                 ),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -702,10 +707,18 @@ class TerrainGridV1Tests(unittest.TestCase):
             self.assertEqual(manifest["producer"]["commit"], FIXTURE_COMMIT)
             self.assertEqual(
                 manifest["source"]["acquisition_time_basis"],
-                "recorded_download_receipt",
+                "filesystem_creation_time",
             )
-            self.assertEqual(manifest["source"]["acquired_at_utc"], FIXTURE_RECEIPT)
-            self.assertEqual(manifest["generation"]["created_utc"], FIXTURE_RECEIPT)
+            self.assertEqual(
+                manifest["source"]["acquired_at_utc"], FIXTURE_SNAPSHOT_CREATED_UTC
+            )
+            self.assertEqual(
+                manifest["generation"]["created_utc"], FIXTURE_SNAPSHOT_CREATED_UTC
+            )
+            self.assertEqual(
+                result[0]["manifest_sha256"],
+                hashlib.sha256((bundle_dir / "manifest.json").read_bytes()).hexdigest(),
+            )
 
             pipeline = manifest["frame"]["horizontal"]["operation_proj_pipeline"]
             self.assertEqual(
@@ -738,9 +751,16 @@ class TerrainGridV1Tests(unittest.TestCase):
                     "_verify_raster_window",
                     return_value=(source, samples, spec.ledger_h0),
                 ),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
             ):
-                repeated_dir, _repeated_result, _repeated_bounds = producer.build_bundle(
+                (
+                    repeated_dir,
+                    _repeated_result,
+                    _repeated_bounds,
+                    _repeated_manifest_sha256,
+                ) = producer.build_bundle(
                     spec,
                     source_dir,
                     ledger,
@@ -831,7 +851,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                 mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
                 mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
                 mock.patch.object(producer, "_verify_raster_window", side_effect=verified_tile),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -1000,7 +1022,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                 mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
                 mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
                 mock.patch.object(producer, "_verify_raster_window", side_effect=fail_east),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -1063,7 +1087,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                 mock.patch.dict(producer.REGIONS, {"golden": parent}, clear=True),
                 mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
                 mock.patch.object(producer, "_verify_raster_window", side_effect=verify_tile),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 mock.patch.object(
                     producer,
                     "validate_adjacent_tile_bundles",
@@ -1079,6 +1105,89 @@ class TerrainGridV1Tests(unittest.TestCase):
                 sorted(path.name for path in output_root.iterdir()), [user_file.name]
             )
             self.assertEqual(user_file.read_text(encoding="utf-8"), "keep this file\n")
+
+    def test_golden_tiles_post_build_manifest_hash_read_failure_rolls_back_owned_outputs(
+        self,
+    ) -> None:
+        parent, source, samples, h0 = _small_adjacent_fixture()
+
+        def verify_tile(_source_dir, _ledger, spec):
+            row, column, rows, columns = spec.source_window
+            return source, samples[row : row + rows, column : column + columns], h0
+
+        real_sha256_file = producer.sha256_file
+        for failing_read_number in (1, 2):
+            with self.subTest(failing_post_build_read=failing_read_number):
+                with _temporary_directory(
+                    prefix="terrain-grid-v1-hash-read-"
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    source_dir = root / "inputs"
+                    source_dir.mkdir()
+                    ledger = root / "ledger.md"
+                    ledger.write_text("local deterministic fixture\n", encoding="utf-8")
+                    output_root = root / "partial-output"
+                    output_root.mkdir()
+                    user_file = output_root / "user-owned-note.txt"
+                    user_file.write_text("keep this file\n", encoding="utf-8")
+                    args = [
+                        "--source-dir", str(source_dir),
+                        "--ledger", str(ledger),
+                        "--schema", str(SCHEMA_PATH),
+                        "--output-root", str(output_root),
+                        "--region", "golden-tiles",
+                    ]
+                    manifest_reads = 0
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+
+                    def fail_manifest_hash_read(path: Path, *, max_bytes=None):
+                        nonlocal manifest_reads
+                        if path.name == "manifest.json":
+                            manifest_reads += 1
+                            if manifest_reads == failing_read_number:
+                                raise producer.ProducerError(
+                                    "injected post-build manifest SHA-256 read failure "
+                                    f"for {path.parent.name}"
+                                )
+                        return real_sha256_file(path, max_bytes=max_bytes)
+
+                    with (
+                        mock.patch.dict(
+                            producer.REGIONS, {"golden": parent}, clear=True
+                        ),
+                        mock.patch.object(
+                            producer, "_producer_commit", return_value=FIXTURE_COMMIT
+                        ),
+                        mock.patch.object(
+                            producer, "_verify_raster_window", side_effect=verify_tile
+                        ),
+                        mock.patch.object(
+                            producer,
+                            "_iso_utc_now",
+                            return_value=FIXTURE_SNAPSHOT_CREATED_UTC,
+                        ),
+                        mock.patch.object(
+                            producer, "sha256_file", side_effect=fail_manifest_hash_read
+                        ),
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        self.assertEqual(producer.main(args), 1)
+
+                    self.assertEqual(stdout.getvalue(), "")
+                    failed_region = "golden-west" if failing_read_number == 1 else "golden-east"
+                    self.assertIn(
+                        "error: generation failed: injected post-build manifest SHA-256 "
+                        f"read failure for {failed_region}; rolled back "
+                        f"{failing_read_number} newly created bundle(s)",
+                        stderr.getvalue(),
+                    )
+                    self.assertEqual(
+                        sorted(path.name for path in output_root.iterdir()),
+                        [user_file.name],
+                    )
+                    self.assertEqual(user_file.read_text(encoding="utf-8"), "keep this file\n")
 
     def test_both_regions_roll_back_new_outputs_and_preserve_existing_user_files(self) -> None:
         first = _small_fixture("fixture-first", -76.5, 39.2, 3.0)
@@ -1114,7 +1223,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                 mock.patch.dict(producer.REGIONS, specs, clear=True),
                 mock.patch.object(producer, "_producer_commit", return_value=FIXTURE_COMMIT),
                 mock.patch.object(producer, "_verify_raster_window", side_effect=verify),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -1183,7 +1294,9 @@ class TerrainGridV1Tests(unittest.TestCase):
                     "_verify_raster_window",
                     return_value=(source, samples, spec.ledger_h0),
                 ),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
                 mock.patch.object(Path, "open", new=fail_first_payload),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
@@ -1220,9 +1333,11 @@ class TerrainGridV1Tests(unittest.TestCase):
                     "_verify_raster_window",
                     return_value=(source, samples, spec.ledger_h0),
                 ),
-                mock.patch.object(producer, "_iso_utc_now", return_value=FIXTURE_RECEIPT),
+                mock.patch.object(
+                    producer, "_iso_utc_now", return_value=FIXTURE_SNAPSHOT_CREATED_UTC
+                ),
             ):
-                bundle_dir, _result, _bounds = producer.build_bundle(*args)
+                bundle_dir, _result, _bounds, _manifest_sha256 = producer.build_bundle(*args)
                 original_manifest = (bundle_dir / "manifest.json").read_bytes()
                 with self.assertRaisesRegex(producer.ProducerError, "refusing to overwrite"):
                     producer.build_bundle(*args)
@@ -1253,6 +1368,26 @@ class TerrainGridV1Tests(unittest.TestCase):
                     manifest["source"]["acquired_at_utc"],
                     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
                 )
+                self.assertEqual(
+                    manifest["source"]["acquisition_time_basis"],
+                    "filesystem_creation_time",
+                )
+                if os.name == "nt":
+                    # Python's Windows st_ctime is the file creation time; the
+                    # ledger timestamp must identify this immutable snapshot.
+                    snapshot_created_at_utc = (
+                        datetime.fromtimestamp(
+                            (SOURCE_DIR / spec.raster_name).stat().st_ctime,
+                            timezone.utc,
+                        )
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                    self.assertEqual(
+                        manifest["source"]["acquired_at_utc"],
+                        snapshot_created_at_utc,
+                    )
                 self.assertNotIn("C:\\", json.dumps(manifest))
                 self.assertTrue(manifest["source"]["source_uri"].startswith("https://"))
                 self.assertEqual(manifest["frame"]["vertical"]["local_up_expression"], "H-H0")

@@ -21,10 +21,13 @@ refuses to overwrite existing bundle directories.
 Before hashing a source file, it validates the ledger byte count against the
 Terrain Grid v1 file-size ceiling and compares that value with the file's
 current length. Hashing is then bounded by the validated expected length. The
-acquisition timestamp comes from the explicit UTC snapshot receipt recorded in
-the supplied ledger row; the current machine's filesystem creation time is not
-used. The manifest uses the v1 `recorded_download_receipt` basis value for that
-receipt.
+local snapshot timestamp comes from the UTC value recorded in the supplied
+ledger row. For these verified snapshots, that value matches the source TIFF's
+Windows `CreationTimeUtc`; it is not a download receipt, product publication
+date, pixel survey date, or accuracy measurement. The manifest preserves this
+timestamp in `source.acquired_at_utc` with the v1
+`filesystem_creation_time` basis. The generator does not infer or claim a
+download time.
 
 `--region both` treats the selected bundle outputs as one command result. If a
 later region fails, the command removes complete bundles created earlier by
@@ -46,8 +49,9 @@ python tools/terrain_grid_v1.py `
 
 The output root receives `baltimore/` and `golden/` bundle directories, each
 containing exactly `manifest.json`, `horizontal_xy.f64le`, and
-`height_samples.f32le`. The manifest contains public URLs and source hashes, but
-no local source or output paths. Source rasters remain local-only.
+`height_samples.f32le`. The JSON summary reports each artifact ID, manifest
+SHA-256, and payload hashes. The manifest contains public URLs and source hashes,
+but no local source or output paths. Source rasters remain local-only.
 
 The functional test command validates the parent's synthetic cross-language
 hash vector and, when `--bundles` and `--source-dir` are supplied, both real

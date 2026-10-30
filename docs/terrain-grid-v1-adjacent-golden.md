@@ -90,10 +90,12 @@ product records are:
 | XML metadata | [USGS metadata sidecar](https://thor-f5.er.usgs.gov/ngtoc/metadata/waf/elevation/1-3_arc-second/UT_COUTAML_D24/USGS_13_n40w106_20260630.xml) | 12,962 | `a43163a50c480a0ac50573a9fe4b9d50e6469ed317edf5399d4bf04ea2de28c7` |
 | TNM product record | [ScienceBase product record](https://www.sciencebase.gov/catalog/item/6a471a0d1ba49bcdf785e0fa) | 2,707 | `9cbbb36df1333b8636521eedfdab35b2e8040bff216ae774dd0e2627a5e92195f` |
 
-The local snapshot receipt recorded in the parent ledger is `2026-10-29T13:41:19Z`
-with `recorded_download_receipt` semantics. It is not the product publication
-date, pixel survey date, or an accuracy measurement. The product was published
-2026-07-01 and its TNM record was last updated 2026-07-02.
+The local snapshot timestamp recorded in the parent ledger is
+`2026-10-29T13:41:19Z`. It matches the source TIFF's Windows `CreationTimeUtc`,
+and the manifest labels its basis `filesystem_creation_time`. It is not a
+download receipt, product publication date, pixel survey date, or an accuracy
+measurement. The product was published 2026-07-01 and its TNM record was last
+updated 2026-07-02.
 
 The source raster is a 10,812 by 10,812 single-band Float32 GeoTIFF in
 `EPSG:4269`, with `AREA_OR_POINT=Area`, scale 1, offset 0, approximately
