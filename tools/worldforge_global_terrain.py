@@ -1098,6 +1098,7 @@ def _gebco_source_record(
         "provider": "NERC British Oceanographic Data Centre / GEBCO",
         "product": GEBCO_RELEASE,
         "release": GEBCO_RELEASE,
+        "asset_id": "10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa",
         "asset_uri": receipts["elevation"]["asset_uri"],
         "asset_version": {"doi": "10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa"},
         "assets": [
@@ -2219,6 +2220,7 @@ class GlobalTerrainProvider:
             "provider": "Copernicus DEM / AWS Open Data registry mirror",
             "product": COP90_DATASET,
             "release": COP90_RELEASE,
+            "asset_id": asset.prefix,
             "asset_uri": asset.uri,
             "asset_version": {"etag": asset.etag, "last_modified": asset.last_modified},
             "byte_length": asset.content_length,
@@ -2422,6 +2424,7 @@ class GlobalTerrainProvider:
             "used_for_classification": True,
             "product": GEBCO_RELEASE,
             "release": GEBCO_RELEASE,
+            "asset_id": "10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa",
             "asset_uri": remote_meta["asset_uri"],
             "asset_version": {"doi": "10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa"},
             "assets": [

@@ -641,8 +641,10 @@ class ExternalSourceIntegrationTests(GlobalTerrainTestCase):
             )
 
             source_meta = {str(item["source_code"]): item for item in record["source_lineage"]}
+            self.assertEqual(source_meta["1"]["asset_id"], "Copernicus_DSM_COG_30_N37_00_W123_00_DEM")
             self.assertTrue(source_meta["1"]["asset_uri"].endswith("/Copernicus_DSM_COG_30_N37_00_W123_00_DEM.tif"))
             self.assertEqual(source_meta["2"]["product"], "GEBCO_2026")
+            self.assertEqual(source_meta["2"]["asset_id"], "10.5285/4f68d5c7-45eb-f999-e063-7086abc036fa")
             self.assertTrue(source_meta["2"]["used_for_mosaic"])
             self.assertTrue(source_meta["2"]["used_for_classification"])
             self.assertTrue(source_meta["2"]["assets"][0]["metadata"]["response_sha256"])
